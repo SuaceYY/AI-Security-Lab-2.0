@@ -66,6 +66,19 @@ class CoordinatorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid allowed docs path"):
                     coordinator.task_from_output(line)
 
+    def test_worker_rejects_out_of_scope_files(self):
+        from tools.issue_claimer.claimer import TaskError, enforce_issue_file_scope
+
+        issue = {
+            "body": (
+                "<!-- dual-ai-task key=coordinator-docs-v1 -->\\n\\n"
+                "仅新增 `docs/coordinator-guide.md`\\n\\n"
+                "允许修改路径：仅 docs/coordinator-guide.md。"
+            )
+        }
+        with self.assertRaisesRegex(TaskError, "Issue explicitly restricts changes"):
+            enforce_issue_file_scope(issue, ["docs/unrelated.md"])
+
     def test_rejects_duplicate_task(self):
         line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
