@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime as dt
 import json
 import logging
@@ -56,7 +57,12 @@ HANDOFF_MAX_CHARS = 4000
 MAX_STAGED_FILES = 100
 MAX_STAGED_BYTES = 5 * 1024 * 1024
 
-TERMINAL_STATUSES = {"succeeded", "failed", "timed_out"}
+TERMINAL_STATUSES = {"succeeded", "failed", "timed_out", "abandoned"}
+RETRY_AUTHORIZED_STATUS = "retry_authorized"
+MANUAL_RETRY_STAGE = "manual_retry_authorized"
+ABANDONED_STATUS = "abandoned"
+MANUAL_CLOSED_STAGE = "manual_closed"
+RECOVERY_REQUIRED_STAGE = "recovery_required"
 SENSITIVE_DIRECTORIES = {
     ".git",
     ".venv",
@@ -693,8 +699,14 @@ def remote_claim_exists(number: int) -> tuple[bool, str]:
 
 def evaluate_issue(state: dict[str, Any], issue: dict[str, Any]) -> tuple[bool, str]:
     number = issue_number(issue)
-    if str(number) in state["tasks"]:
-        return False, f"issue #{number} is already recorded in local state"
+    existing = state["tasks"].get(str(number))
+    if existing is not None:
+        authorized = (
+            existing.get("status") == RETRY_AUTHORIZED_STATUS
+            and existing.get("stage") == MANUAL_RETRY_STAGE
+        )
+        if not authorized:
+            return False, f"issue #{number} is already recorded in local state"
 
     if str(issue.get("state", "")).upper() != "OPEN":
         return False, f"issue #{number} is not open"
@@ -713,28 +725,40 @@ def evaluate_issue(state: dict[str, Any], issue: dict[str, Any]) -> tuple[bool, 
     return True, "eligible"
 
 
-def select_next_issue() -> dict[str, Any] | None:
+def find_next_issue(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
     logger = logging.getLogger("issue_claimer")
-    state = load_state()
 
     if not state.get("first_run_completed", False):
         try:
             issue = fetch_issue(FIRST_ISSUE)
         except TaskError as exc:
             logger.error("first-run issue check failed: %s", exc)
-            return None
+            return None, f"first-run issue check failed: {exc}"
         eligible, reason = evaluate_issue(state, issue)
         if eligible:
-            return issue
+            return issue, reason
         logger.info("issue #%s is not eligible: %s", FIRST_ISSUE, reason)
-        return None
+        return None, reason
 
-    for issue in list_ready_issues():
+    issues = list_ready_issues()
+    if not issues:
+        return None, f"no open issues with the '{LABEL}' label"
+
+    skipped: list[str] = []
+    for issue in issues:
         eligible, reason = evaluate_issue(state, issue)
         if eligible:
-            return issue
+            return issue, reason
         logger.info("issue #%s skipped: %s", issue_number(issue), reason)
-    return None
+        skipped.append(f"#{issue_number(issue)}: {reason}")
+    return None, "; ".join(skipped)
+
+
+def select_next_issue() -> dict[str, Any] | None:
+    issue, _ = find_next_issue(load_state())
+    return issue
 
 
 def ensure_clean_worktree() -> None:
@@ -1308,6 +1332,20 @@ def process_issue(issue: dict[str, Any]) -> None:
     state = load_state()
     original_branch = ""
 
+    previous = state["tasks"].get(str(number))
+    if previous is not None:
+        state.setdefault("recovery_history", []).append(
+            {
+                "issue_number": number,
+                "action": "retry_started",
+                "archived_at": utc_now(),
+                "previous_status": previous.get("status"),
+                "previous_stage": previous.get("stage"),
+                "previous_failure_reason": previous.get("failure_reason"),
+                "task": copy.deepcopy(previous),
+            }
+        )
+
     task: dict[str, Any] = {
         "issue_number": number,
         "title": title,
@@ -1607,6 +1645,110 @@ def recover_stale_tasks() -> bool:
     return True
 
 
+def manual_recover(
+    number: int,
+    action: str,
+    confirm: bool,
+    note: str = "",
+) -> int:
+    if action not in {"retry", "close"}:
+        raise TaskError(f"unsupported recovery action: {action}")
+
+    logger = configure_logging()
+    lock = InstanceLock()
+    if not lock.acquire():
+        print("recovery blocked: another issue claimer instance is already running")
+        return 1
+
+    try:
+        state = load_state()
+        task = state["tasks"].get(str(number))
+        if task is None:
+            print(f"issue #{number} is not recorded in local state")
+            return 2
+        if task.get("stage") != RECOVERY_REQUIRED_STAGE:
+            print(
+                f"issue #{number} is not awaiting manual recovery "
+                f"(stage={task.get('stage')}); no changes were written"
+            )
+            return 2
+
+        event = {
+            "issue_number": number,
+            "action": action,
+            "recovered_at": utc_now(),
+            "note": trim(note, 500),
+            "previous_status": task.get("status"),
+            "previous_stage": task.get("stage"),
+            "previous_failure_reason": task.get("failure_reason"),
+            "task": copy.deepcopy(task),
+        }
+        summary = {
+            key: event[key]
+            for key in (
+                "action",
+                "recovered_at",
+                "note",
+                "previous_status",
+                "previous_stage",
+                "previous_failure_reason",
+            )
+        }
+
+        if not confirm:
+            print("recovery plan (no changes written):")
+            print(f"  issue: #{number}")
+            print(f"  action: {action}")
+            print(f"  previous status: {task.get('status')}")
+            print(f"  previous stage: {task.get('stage')}")
+            print(f"  failure: {task.get('failure_reason') or '(none)'}")
+            if action == "retry":
+                print("  result: authorize one explicit retry of this issue")
+            else:
+                print("  result: close this task without deleting its record")
+            print("use --confirm to apply this recovery")
+            return 2
+
+        state.setdefault("recovery_history", []).append(event)
+        task["manual_recovery"] = summary
+        task.setdefault("recovery_history", []).append(summary)
+
+        if action == "retry":
+            task["status"] = RETRY_AUTHORIZED_STATUS
+            task["stage"] = MANUAL_RETRY_STAGE
+            task["next_step"] = (
+                "explicit retry authorized; the next worker run may claim this issue"
+            )
+        else:
+            task["status"] = ABANDONED_STATUS
+            task["stage"] = MANUAL_CLOSED_STAGE
+            task["next_step"] = (
+                "manual recovery closed; issue remains recorded and will not be re-claimed"
+            )
+
+        touch_task(task)
+        save_state(state)
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task.get("tests", "unknown"),
+            task.get("recovery", ""),
+        )
+        logger.info(
+            "manual recovery applied to issue #%s: action=%s previous_stage=%s",
+            number,
+            action,
+            event["previous_stage"],
+        )
+        print(f"issue #{number} recovery applied: {action}")
+        print(f"  audit entries: {len(state['recovery_history'])}")
+        print(f"  next step: {task['next_step']}")
+        return 0
+    finally:
+        lock.release()
+
+
 def interruptible_sleep(seconds: int) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -1812,9 +1954,8 @@ def dry_run() -> int:
 
     try:
         state = load_state()
-        issue = fetch_issue(FIRST_ISSUE)
-        eligible, reason = evaluate_issue(state, issue)
-        labels = issue_labels(issue)
+        issue, reason = find_next_issue(state)
+        eligible = issue is not None
 
         print("preflight:")
         print(f"  gh: {info.get('gh_version')}")
@@ -1822,11 +1963,15 @@ def dry_run() -> int:
         print(f"  repo: {REPO}")
         print(f"  project_root: {PROJECT_ROOT}")
         print("issue:")
-        print(f"  number: {issue_number(issue)}")
-        print(f"  title: {issue.get('title')}")
-        print(f"  state: {issue.get('state')}")
-        print(f"  labels: {', '.join(labels) if labels else '(none)'}")
-        print(f"  url: {issue.get('url')}")
+        if issue is None:
+            print("  number: (none)")
+        else:
+            labels = issue_labels(issue)
+            print(f"  number: {issue_number(issue)}")
+            print(f"  title: {issue.get('title')}")
+            print(f"  state: {issue.get('state')}")
+            print(f"  labels: {', '.join(labels) if labels else '(none)'}")
+            print(f"  url: {issue.get('url')}")
         print(f"  first_run_completed: {bool(state.get('first_run_completed'))}")
         print(f"claimable: {'yes' if eligible else 'no'}")
         print(f"reason: {reason}")
@@ -1857,7 +2002,31 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stop", help="stop the background claimer")
     status_parser = subparsers.add_parser("status", help="show claimer status")
     status_parser.add_argument("--json", action="store_true", help="print JSON")
-    subparsers.add_parser("dry-run", help="check issue #2 without calling AI")
+    subparsers.add_parser(
+        "dry-run",
+        help="check the next issue with the same selection rules as the worker",
+    )
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="manually resolve a task in the recovery_required stage",
+    )
+    recover_parser.add_argument("--issue", type=int, required=True)
+    recover_parser.add_argument(
+        "--action",
+        choices=("retry", "close"),
+        required=True,
+        help="retry explicitly authorizes one new claim; close keeps the record",
+    )
+    recover_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="write the recovery; without this flag only the plan is shown",
+    )
+    recover_parser.add_argument(
+        "--note",
+        default="",
+        help="optional audit note stored with the recovery record",
+    )
     subparsers.add_parser("worker")
     return parser
 
@@ -1875,6 +2044,13 @@ def main(argv: list[str] | None = None) -> int:
             return print_status(args.json)
         if args.command == "dry-run":
             return dry_run()
+        if args.command == "recover":
+            return manual_recover(
+                args.issue,
+                args.action,
+                args.confirm,
+                args.note,
+            )
         if args.command == "worker":
             return worker_main()
         parser.error("unknown command")
