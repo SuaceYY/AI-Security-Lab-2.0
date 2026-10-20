@@ -1150,20 +1150,38 @@ def context_exhausted(result: CommandResult) -> bool:
     )
 
 
-def find_opencode_session(number: int, attempt: int) -> str | None:
-    """Find a unique session by exact task title; never use global --continue."""
+def find_opencode_session(number: int, attempt: int, started_after_ms: int | None = None) -> str | None:
+    """Resolve one task-owned session using structured OpenCode metadata."""
     result = run_command(
-        ["opencode", "session", "list"], cwd=PROJECT_ROOT, timeout=30,
-        env=sanitized_opencode_env(),
+        ["opencode", "session", "list", "--format", "json"],
+        cwd=PROJECT_ROOT, timeout=30, env=sanitized_opencode_env(),
     )
     if not result.ok:
         return None
+    try:
+        sessions = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(sessions, list):
+        return None
     title = f"AI issue #{number} attempt {attempt}"
     matches = []
-    for line in result.stdout.splitlines():
-        match = re.match(r"^\s*(ses_[A-Za-z0-9]+)\s{2,}(.+?)\s*$", line)
-        if match and match.group(2).strip() == title:
-            matches.append(match.group(1))
+    for entry in sessions:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("id")
+        if not isinstance(sid, str) or not re.fullmatch(r"ses_[A-Za-z0-9]+", sid):
+            continue
+        if entry.get("title") != title:
+            continue
+        directory = entry.get("directory")
+        if not isinstance(directory, str) or os.path.normcase(os.path.normpath(directory)) != os.path.normcase(os.path.normpath(str(PROJECT_ROOT))):
+            continue
+        created = entry.get("created")
+        if started_after_ms is not None:
+            if not isinstance(created, (int, float)) or isinstance(created, bool) or created < started_after_ms:
+                continue
+        matches.append(sid)
     return matches[0] if len(matches) == 1 else None
 
 
@@ -1510,8 +1528,9 @@ def process_issue(issue: dict[str, Any]) -> None:
                     f"task exceeded the {TASK_TIMEOUT_SECONDS}-second overall timeout"
                 )
 
+            session_started_after_ms = int(time.time() * 1000) - 5000
             result = run_opencode(issue, attempt, previous_error, remaining)
-            session_id = find_opencode_session(number, attempt)
+            session_id = find_opencode_session(number, attempt, session_started_after_ms)
             if session_id:
                 task["opencode_session_id"] = session_id
                 save_state(state)
