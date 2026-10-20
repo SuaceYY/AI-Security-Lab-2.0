@@ -485,6 +485,7 @@ def write_checkpoint(
         "branch": task.get("branch"),
         "commit_sha": task.get("commit_sha"),
         "pr_url": task.get("pr_url"),
+        "opencode_session_id": task.get("opencode_session_id"),
         "tests": trim(tests, 300),
         "next_step": trim(next_step, CHECKPOINT_DETAIL_LIMIT),
         "recovery": trim(recovery, CHECKPOINT_DETAIL_LIMIT),
@@ -1106,6 +1107,7 @@ def run_opencode(
     attempt: int,
     previous_error: str,
     timeout: int,
+    session_id: str | None = None,
 ) -> CommandResult:
     number = issue_number(issue)
     command = [
@@ -1117,6 +1119,10 @@ def run_opencode(
         "--title",
         f"AI issue #{number} attempt {attempt}",
     ]
+    if session_id:
+        if not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
+            raise TaskError("invalid OpenCode session ID")
+        command.extend(["--session", session_id])
     model = os.environ.get("ISSUE_CLAIMER_OPENCODE_MODEL", "").strip()
     if model:
         command.extend(["--model", model])
@@ -1144,8 +1150,25 @@ def context_exhausted(result: CommandResult) -> bool:
     )
 
 
-def recovery_command() -> str:
-    return f'opencode run --dir "{PROJECT_ROOT}" --continue'
+def find_opencode_session(number: int, attempt: int) -> str | None:
+    """Find a unique session by exact task title; never use global --continue."""
+    result = run_command(
+        ["opencode", "session", "list"], cwd=PROJECT_ROOT, timeout=30,
+        env=sanitized_opencode_env(),
+    )
+    if not result.ok:
+        return None
+    title = f"AI issue #{number} attempt {attempt}"
+    matches = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*(ses_[A-Za-z0-9]+)\s+(.+?)\s{2,}\S", line)
+        if match and match.group(2).strip() == title:
+            matches.append(match.group(1))
+    return matches[0] if len(matches) == 1 else None
+
+
+def recovery_command(session_id: str | None = None) -> str:
+    return f"opencode --session {session_id}" if session_id else "opencode session list"
 
 
 FRONTEND_FILES = {
@@ -1488,16 +1511,33 @@ def process_issue(issue: dict[str, Any]) -> None:
                 )
 
             result = run_opencode(issue, attempt, previous_error, remaining)
+            session_id = find_opencode_session(number, attempt)
+            if session_id:
+                task["opencode_session_id"] = session_id
+                save_state(state)
+                logger.info("OpenCode session for issue #%s: %s", number, session_id)
             if result.timed_out:
                 raise TaskTimeout(
                     f"OpenCode exceeded the {TASK_TIMEOUT_SECONDS}-second task timeout"
                 )
             if context_exhausted(result):
-                task["next_step"] = "inspect changes, then resume manually"
-                raise StopWorker(
-                    "OpenCode reported context exhaustion; automatic session resume is "
-                    f"not enabled. Recover with: {recovery_command()}"
-                )
+                if not session_id:
+                    task["next_step"] = "manual review: exact OpenCode session unavailable"
+                    raise StopWorker("OpenCode context exhausted; no unique session ID found")
+                remaining = int(task_deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TaskTimeout("task deadline reached before context recovery")
+                task["stage"] = f"opencode_resume_{attempt}"
+                task["next_step"] = "one bounded recovery of the exact OpenCode session"
+                save_state(state)
+                write_checkpoint(task, task["stage"], task["next_step"])
+                logger.warning("recovering exact OpenCode session %s for issue #%s", session_id, number)
+                result = run_opencode(issue, attempt, previous_error, remaining, session_id=session_id)
+                if result.timed_out:
+                    raise TaskTimeout("OpenCode session recovery timed out")
+                if context_exhausted(result):
+                    task["next_step"] = "manual review: recovery exhausted"
+                    raise StopWorker(f"OpenCode context exhausted after one recovery; inspect {recovery_command(session_id)}")
             if result.returncode != 0:
                 previous_error = (
                     f"OpenCode exited with code {result.returncode}: "
