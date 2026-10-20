@@ -146,6 +146,7 @@ class WebBatch:
             command(["fetch", "origin", "main"])
             self.base_sha = command(["rev-parse", "origin/main"])
             command(["switch", "-c", self.branch, "origin/main"])
+            self.config = read_local_git_config()  # Own branch tracking is legitimate.
             self.head = self.base_sha
             issue = self.api("issues", "-X", "POST", "-f", "title=" + self.plan["title"],
                              "-f", "body=<!-- web-plan-sha256=" + digest + " -->\n\n"
@@ -330,6 +331,7 @@ class WebBatch:
             stage_and_validate_changes(paths)
             self.head = commit_changes(self.issue, "web batch " + self.batch_id + " round " + str(number) + " " + phase)
             push_branch(self.branch)
+            self.config = read_local_git_config()  # push -u updates only our tracking baseline.
             self.local_checkpoint("verified_commit", {"head_sha": self.head})
             if self.pr is None:
                 created = self.api(

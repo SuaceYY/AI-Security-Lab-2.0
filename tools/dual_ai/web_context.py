@@ -128,6 +128,7 @@ class VisibleWebSessions:
         provider_id, model_id = b["model"].split("/", 1)
         body = {
             "model": {"providerID": provider_id, "modelID": model_id},
+            "agent": "plan" if role == "planner" else "build",
             "parts": [{"type": "text", "text": prompt}],
         }
         if role == "planner":

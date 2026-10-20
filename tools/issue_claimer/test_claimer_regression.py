@@ -49,18 +49,27 @@ class ClaimerRegressionTests(TestCase):
             self.assertIsNone(claimer.find_opencode_session(9, 1, 1500))
 
     def test_invalid_session_rejected_before_execution(self):
-        with self.assertRaises(claimer.TaskError):
+        with (
+            mock.patch.object(claimer, "load_binding", return_value={"session_id": "ses_safe123"}),
+            mock.patch.object(claimer, "run_prompt") as runner,
+            self.assertRaises(claimer.StopWorker),
+        ):
             claimer.run_opencode({"number": 9, "body": "test"}, 1, "", 10, session_id="--continue")
+        runner.assert_not_called()
 
     def test_resume_prompt_does_not_replay_issue_body(self):
         issue = {"number": 9, "title": "test", "body": "SENSITIVE_UNIQUE_LONG_ISSUE_BODY"}
-        with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, "", "")) as runner:
+        with (
+            mock.patch.object(claimer, "load_binding", return_value={"session_id": "ses_safe123"}),
+            mock.patch.object(claimer, "run_prompt", return_value=("done", "ses_safe123")) as runner,
+            mock.patch.object(claimer, "run_command") as command,
+        ):
             claimer.run_opencode(issue, 1, "", 20, session_id="ses_safe123")
-        command = runner.call_args.args[0]
-        self.assertIn("--session", command)
-        self.assertNotIn("SENSITIVE_UNIQUE_LONG_ISSUE_BODY", command[-1])
-        self.assertIn("继续当前已授权任务", command[-1])
-        self.assertNotIn("--auto", command)
+        prompt = runner.call_args.args[1]
+        self.assertEqual(runner.call_args.args[0], "executor")
+        self.assertNotIn("SENSITIVE_UNIQUE_LONG_ISSUE_BODY", prompt)
+        self.assertIn("继续当前已授权任务", prompt)
+        command.assert_not_called()
 
     def test_explicit_issue_scope_rejects_unrelated_workflow(self):
         issue = {"body": "仅允许新增 `docs/automation-e2e-smoke.md`，不要修改其他文件"}
