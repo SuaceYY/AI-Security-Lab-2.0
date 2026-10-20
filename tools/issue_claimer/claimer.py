@@ -1161,7 +1161,7 @@ def find_opencode_session(number: int, attempt: int) -> str | None:
     title = f"AI issue #{number} attempt {attempt}"
     matches = []
     for line in result.stdout.splitlines():
-        match = re.match(r"^\s*(ses_[A-Za-z0-9]+)\s+(.+?)\s{2,}\S", line)
+        match = re.match(r"^\s*(ses_[A-Za-z0-9]+)\s{2,}(.+?)\s*$", line)
         if match and match.group(2).strip() == title:
             matches.append(match.group(1))
     return matches[0] if len(matches) == 1 else None
