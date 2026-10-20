@@ -8,10 +8,25 @@ from tools.dual_ai import coordinator
 
 
 class CoordinatorTests(unittest.TestCase):
-    def test_valid_task(self):
-        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
-        self.assertEqual(coordinator.task_from_output(line)["key"], "coordinator-docs-v1")
+        def test_valid_task(self):
+        import json
 
+        task = {
+            "title": "Document coordinator safety gates",
+            "body": (
+                "新增 docs/coordinator-guide.md，说明协调器的安全机制。"
+                "允许修改路径：仅 docs/coordinator-guide.md。"
+                "禁止修改 tools/issue_claimer 和 .github/ 目录。"
+                "禁止自动合并，PR 等待人工审核。"
+            ),
+            "key": "coordinator-docs-v1",
+        }
+
+        line = "GLM_TASK_JSON: " + json.dumps(task, ensure_ascii=False)
+        self.assertEqual(
+            coordinator.task_from_output(line)["key"],
+            "coordinator-docs-v1",
+        )
     def test_rejects_duplicate_task(self):
         line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
