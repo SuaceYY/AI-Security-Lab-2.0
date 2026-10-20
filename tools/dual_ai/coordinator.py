@@ -213,8 +213,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="Enable GitHub Issue/comment writes")
     parser.add_argument("--once", action="store_true", help="Run one bounded cycle")
+    parser.add_argument("--status", action="store_true", help="Show checkpoint without model or GitHub calls")
     parser.add_argument("--interval", type=int, default=120)
     args = parser.parse_args()
+    if args.status:
+        print(json.dumps(load_state(), ensure_ascii=False, indent=2))
+        return 0
     if args.interval < 60:
         parser.error("minimum polling interval is 60 seconds")
     if not args.once and not args.write:
