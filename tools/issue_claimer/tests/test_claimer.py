@@ -110,7 +110,7 @@ class IssueSelectionTests(TempDataTest):
         }
         with (
             mock.patch.object(m, "load_state", return_value=state),
-            mock.patch.object(m, "fetch_issue", side_effect=AssertionError),
+            mock.patch.object(m, "fetch_issue", side_effect=lambda number: {"number": number, "title": "test", "body": "任务说明", "state": "OPEN", "labels": [{"name": "ai-ready"}]}),
             mock.patch.object(
                 m,
                 "list_ready_issues",
@@ -216,7 +216,7 @@ class DryRunTests(TempDataTest):
         with (
             mock.patch.object(m, "preflight", return_value={}),
             mock.patch.object(m, "load_state", return_value=state),
-            mock.patch.object(m, "fetch_issue", side_effect=AssertionError),
+            mock.patch.object(m, "fetch_issue", side_effect=lambda number: {"number": number, "title": "test", "body": "任务说明", "state": "OPEN", "labels": [{"name": "ai-ready"}]}),
             mock.patch.object(m, "list_ready_issues", return_value=[issue]),
             mock.patch.object(m, "remote_claim_exists", return_value=(False, "")),
             redirect_stdout(output),
@@ -655,7 +655,7 @@ class RepositoryStateTests(TempDataTest):
         self.assertEqual(task["status"], "failed")
         self.assertEqual(task["stage"], "failed")
         self.assertIn("RuntimeError", task["failure_reason"])
-        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("opencode session list", task["recovery"])
         self.assertIn("completed_at", task)
         checkpoint.assert_called()
 
@@ -675,7 +675,7 @@ class RepositoryStateTests(TempDataTest):
         self.assertEqual(task["status"], "failed")
         self.assertEqual(task["stage"], "interrupted")
         self.assertIn("KeyboardInterrupt", task["failure_reason"])
-        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("opencode session list", task["recovery"])
         self.assertIn("completed_at", task)
         checkpoint.assert_called()
 
@@ -1087,7 +1087,7 @@ class CheckpointTests(TempDataTest):
         self.assertEqual(task["stage"], "recovery_required")
         self.assertEqual(task["previous_stage"], "opencode_attempt_1")
         self.assertIn("previous worker stopped", task["failure_reason"])
-        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("opencode session list", task["recovery"])
         self.assertIn("recovered_at", task)
         self.assertEqual(task["recovery_count"], 1)
         self.assertTrue(state["first_run_completed"])
