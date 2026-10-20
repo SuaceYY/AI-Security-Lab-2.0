@@ -1,8 +1,12 @@
 """No network or models: three-cycle contract and failure boundaries."""
 import copy
 import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from tools.dual_ai import web_batch_runtime
 
 from tools.dual_ai.web_batch import (
     HumanRequired, check_scope, parse_result, run_batch, validate_plan,
@@ -76,6 +80,44 @@ class BatchContractTests(unittest.TestCase):
                         run_batch(bridge, PLAN)
                     self.assertEqual(bridge.events[-1], (phase, number))
                     self.assertFalse(any(p == "finish" for p, _ in bridge.events))
+
+    def test_recovered_committed_development_is_published_once_without_model_replay(self):
+        bridge = Bridge()
+        verified_capture = {"published": "development", "number": 1}
+        result = run_batch(bridge, PLAN, captured_development=verified_capture)
+        self.assertEqual(result["rounds"], 3)
+        self.assertNotIn(("develop", 1), bridge.events)
+        self.assertEqual(bridge.events.count(("publish_development", 1)), 1)
+        self.assertIn(("review", 1), bridge.events)
+        self.assertIn(("repair", 3), bridge.events)
+
+    def test_snapshot_reference_backend_is_readonly_context_not_edit_scope(self):
+        plan = copy.deepcopy(PLAN)
+        plan["allowed_suffixes"] = [".ts", ".tsx"]
+        batch = web_batch_runtime.WebBatch.__new__(web_batch_runtime.WebBatch)
+        batch.plan = plan
+        batch.base_sha = "a" * 40
+        batch.head = "b" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("frontend/src/scanApi.ts", "frontend/tests/scanApi.test.ts",
+                         "frontend/src/App.tsx", "frontend/src/fileFilter.ts",
+                         "backend/main.py"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("safe content\n", encoding="utf-8")
+            with (patch.object(web_batch_runtime, "ROOT", root),
+                  patch.object(web_batch_runtime, "command",
+                               return_value="frontend/src/scanApi.ts\nfrontend/tests/scanApi.test.ts"),
+                  patch.object(web_batch_runtime, "collect_changed_paths", return_value=[])):
+                snapshot = batch.snapshot(False)
+            self.assertIn("backend/main.py", snapshot["files"])
+            self.assertIn("frontend/src/scanApi.ts", snapshot["files"])
+            with (patch.object(web_batch_runtime, "ROOT", root),
+                  patch.object(web_batch_runtime, "command", return_value="backend/main.py"),
+                  patch.object(web_batch_runtime, "collect_changed_paths", return_value=[])):
+                with self.assertRaises(HumanRequired):
+                    batch.snapshot(False)
 
     def test_failed_github_publication_never_calls_next_model(self):
         bridge = Bridge(("publish_review", 1))
