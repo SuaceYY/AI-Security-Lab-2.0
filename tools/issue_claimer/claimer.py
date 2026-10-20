@@ -590,6 +590,15 @@ def read_origin_url() -> str:
     return require_ok(git(["remote", "get-url", "origin"]), "read origin remote")
 
 
+def origin_matches_repo(url: str) -> bool:
+    expected = re.escape(REPO)
+    pattern = (
+        rf"^(?:https://github\.com/|ssh://git@github\.com(?::\d+)?/|"
+        rf"git@github\.com:){expected}(?:\.git)?/?$"
+    )
+    return re.fullmatch(pattern, url.strip(), flags=re.IGNORECASE) is not None
+
+
 def read_local_git_config() -> str:
     result = git(["config", "--local", "--list"])
     if result.returncode != 0:
@@ -613,9 +622,8 @@ def preflight(require_opencode: bool = True) -> dict[str, str]:
     if Path(root).resolve() != PROJECT_ROOT.resolve():
         raise TaskError(f"unexpected git root: {root}")
 
-    remote = read_origin_url()
-    if REPO.lower() not in remote.lower():
-        raise TaskError(f"origin does not point to {REPO}: {remote}")
+    if not origin_matches_repo(read_origin_url()):
+        raise TaskError(f"origin does not point to the expected repository: {REPO}")
 
     auth = gh(["auth", "status", "--hostname", "github.com"], timeout=30)
     if auth.returncode != 0:
@@ -1146,10 +1154,8 @@ def process_issue(issue: dict[str, Any]) -> None:
         )
         base_sha = require_ok(git(["rev-parse", "HEAD"]), "read base commit")
         origin_baseline = read_origin_url()
-        if REPO.lower() not in origin_baseline.lower():
-            raise TaskError(
-                f"origin does not point to {REPO}: {origin_baseline}"
-            )
+        if not origin_matches_repo(origin_baseline):
+            raise TaskError(f"origin does not point to the expected repository: {REPO}")
         config_baseline = read_local_git_config()
         task["stage"] = "branch_created"
         task["next_step"] = "run OpenCode and fixed verification"

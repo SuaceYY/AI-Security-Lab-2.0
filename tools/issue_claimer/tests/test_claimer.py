@@ -240,6 +240,27 @@ class StagingTests(TempDataTest):
 
 
 class RepositoryStateTests(TempDataTest):
+    def test_origin_validation_requires_exact_github_repository(self) -> None:
+        valid = [
+            "https://github.com/SuaceYY/AI-Security-Lab-2.0",
+            "https://github.com/SuaceYY/AI-Security-Lab-2.0.git",
+            "git@github.com:SuaceYY/AI-Security-Lab-2.0.git",
+            "ssh://git@github.com/SuaceYY/AI-Security-Lab-2.0.git",
+        ]
+        invalid = [
+            "https://evil.example/SuaceYY/AI-Security-Lab-2.0.git",
+            "https://github.com.evil.example/SuaceYY/AI-Security-Lab-2.0.git",
+            "https://github.com/attacker/AI-Security-Lab-2.0.git",
+            "git@evil.example:SuaceYY/AI-Security-Lab-2.0.git",
+            "https://github.com/SuaceYY/AI-Security-Lab-2.0/extra",
+        ]
+        for url in valid:
+            with self.subTest(url=url):
+                self.assertTrue(m.origin_matches_repo(url))
+        for url in invalid:
+            with self.subTest(url=url):
+                self.assertFalse(m.origin_matches_repo(url))
+
     def test_origin_change_is_rejected(self) -> None:
         def fake_git(args: list[str], timeout: int = 120) -> m.CommandResult:
             if args == ["branch", "--show-current"]:
