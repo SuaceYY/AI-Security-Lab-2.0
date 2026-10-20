@@ -111,8 +111,8 @@ class RuntimeTests(unittest.TestCase):
     def test_real_git_commit_push_and_next_guard_preserve_staging_and_tracking(self):
         # Real local repositories only; GitHub, validation and models are mocked.
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder) / "project"
-            remote = Path(folder) / "remote.git"
+            root = Path(folder).resolve() / "project"
+            remote = Path(folder).resolve() / "remote.git"
             root.mkdir()
             def git(*args):
                 completed = subprocess.run(["git", *args], cwd=root, capture_output=True,

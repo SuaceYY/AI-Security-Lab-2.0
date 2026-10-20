@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 
 ROUNDS = 3
@@ -106,6 +107,9 @@ def run_batch(bridge, plan: dict) -> dict:
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", default="tools/dual_ai/web_batch_plan.json")
     parser.add_argument("--batch-id", required=True)

@@ -306,7 +306,7 @@ class WebBatch:
                 from urllib.parse import quote
                 data = self.api("contents/" + quote(path, safe="/") + "?ref=" + self.head)
                 published = base64.b64decode(data["content"]).decode("utf-8-sig")
-                if published != content:
+                if published.replace("\r\n", "\n") != content:
                     raise HumanRequired("GitHub 源码与本地已验证内容不一致：" + path)
                 sources[path] = {"sha": data.get("sha"), "content": published}
             else:
