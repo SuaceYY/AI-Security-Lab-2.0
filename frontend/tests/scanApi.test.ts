@@ -291,6 +291,26 @@ test('拒绝畸形 HTTP 200 响应', async () => {
   }
 })
 
+test('畸形 HTTP 200 不进入成功状态且错误提示可读', async () => {
+  let successResult: ScanResponse | null = null
+  let errorMessage: string | null = null
+
+  try {
+    successResult = await submitScan(
+      [],
+      successfulFetch({ ...VALID_RESPONSE, findings: [null] }),
+    )
+  } catch (error) {
+    errorMessage = formatScanError(error)
+  }
+
+  const renderedFindings = successResult?.findings.map(finding => finding.rule_id) ?? null
+
+  assert.equal(successResult, null)
+  assert.equal(renderedFindings, null)
+  assert.equal(errorMessage, '扫描失败：服务端返回了无法识别的结果。')
+})
+
 test('保留失败 HTTP 与网络异常的既有行为', async () => {
   const httpFailures: Array<[number, unknown, string | undefined, string]> = [
     [
