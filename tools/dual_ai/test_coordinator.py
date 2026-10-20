@@ -65,6 +65,14 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple explicit allowed docs paths"):
             coordinator.task_from_output(output)
 
+    def test_rejects_multiple_paths_in_one_scope_declaration(self):
+        body = (
+            "允许修改路径：仅新增 docs/first.md 和 docs/second.md。"
+            + "验收标准和固定验证要求。" * 15
+        )
+        with self.assertRaisesRegex(ValueError, "multiple explicit allowed docs paths"):
+            coordinator.declared_docs_path(body)
+
     def test_rejects_automatic_merge(self):
         import json
 
