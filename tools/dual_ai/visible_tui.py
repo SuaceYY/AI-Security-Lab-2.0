@@ -62,12 +62,6 @@ def message_text(message: dict) -> str:
     )
 
 
-def message_id(message: dict) -> str | None:
-    info = message.get("info")
-    value = info.get("id") if isinstance(info, dict) else None
-    return value if isinstance(value, str) else None
-
-
 def message_role(message: dict) -> str | None:
     info = message.get("info")
     value = info.get("role") if isinstance(info, dict) else None
@@ -104,41 +98,21 @@ def run_prompt(
     session_id = binding["session_id"]
     client.get_session(session_id)
     if client.get_session_status(session_id) != "idle":
-        raise TUITransportError("bound visible TUI session is not idle; refusing to queue a prompt")
-    before = client.get_messages(session_id)
-    prior_ids = {message_id(item) for item in before if message_id(item)}
+        raise TUITransportError("bound visible TUI session is not idle; refusing a second prompt")
 
-    # Exactly one submission. If the response is ambiguous, stop; never resend.
-    client.send_prompt(prompt)
+    # The attached TUI observes this exact session while the server runs the call.
+    # Model and session are explicit; an ambiguous POST is never retried.
+    response = client.send_session_message(
+        session_id, prompt, str(binding.get("model") or ""), timeout=timeout + 5
+    )
     tag = "GLM" if role == "planner" else "DeepSeek"
     print(f"[{tag}] prompt submitted to the bound visible TUI session; watch the native window.", file=output, flush=True)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        messages = client.get_messages(session_id)
-        new_messages = [item for item in messages if message_id(item) not in prior_ids]
-        user = next((item for item in new_messages if message_role(item) == "user" and message_text(item) == prompt), None)
-        status = client.get_session_status(session_id)
-        if user is not None:
-            user_id = message_id(user)
-            after_user = []
-            found_user = False
-            for item in new_messages:
-                if message_id(item) == user_id:
-                    found_user = True
-                    continue
-                if found_user and message_role(item) == "assistant":
-                    after_user.append(item)
-            if status == "idle" and after_user:
-                text = "\n".join(message_text(item) for item in after_user if message_text(item)).strip()
-                if not text:
-                    raise TUITransportError("visible session finished without assistant text")
-                verify_response_model(after_user[-1], str(binding.get("model") or ""))
-                print(text, file=output, flush=True)
-                return text, session_id
-        time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
-
-    raise VisiblePromptTimeout(
-        f"timed out waiting for visible {role} session {session_id}; prompt was not resent"
-    )
+    if message_role(response) != "assistant":
+        raise TUITransportError("OpenCode returned a non-assistant response")
+    verify_response_model(response, str(binding.get("model") or ""))
+    text = message_text(response).strip()
+    if not text:
+        raise TUITransportError("visible session finished without assistant text")
+    print(text, file=output, flush=True)
+    return text, session_id
 
