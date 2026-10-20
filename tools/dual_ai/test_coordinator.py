@@ -28,6 +28,51 @@ class CoordinatorTests(unittest.TestCase):
             "coordinator-docs-v1",
         )
 
+    def test_multiline_json_and_explicit_new_file_path(self):
+        import json
+
+        task = {
+            "title": "Document coordinator handoff safeguards",
+            "body": (
+                "修改范围：仅新增 docs/dual-ai-coordinator-guide.md。"
+                "验收标准：说明当前限制、只读检查和人工合并闸门，不夸大功能。"
+                "固定验证：仅该文件变更，UTF-8 且非空。"
+            ),
+            "key": "coordinator-docs-v2",
+        }
+        output = "规划说明。\nGLM_TASK_JSON: " + json.dumps(
+            task, ensure_ascii=False, indent=2
+        )
+        parsed = coordinator.task_from_output(output)
+        self.assertEqual(parsed["key"], "coordinator-docs-v2")
+        self.assertEqual(
+            coordinator.declared_docs_path(parsed["body"]),
+            "docs/dual-ai-coordinator-guide.md",
+        )
+
+    def test_rejects_multiple_explicit_allowed_paths(self):
+        import json
+
+        task = {
+            "title": "Document coordinator handoff safeguards",
+            "body": (
+                "允许修改路径：仅 docs/first.md。仅新增 docs/second.md。"
+                + "验收标准和固定验证要求。" * 15
+            ),
+            "key": "coordinator-docs-v2",
+        }
+        output = "GLM_TASK_JSON: " + json.dumps(task, ensure_ascii=False)
+        with self.assertRaisesRegex(ValueError, "multiple explicit allowed docs paths"):
+            coordinator.task_from_output(output)
+
+    def test_rejects_multiple_paths_in_one_scope_declaration(self):
+        body = (
+            "允许修改路径：仅新增 docs/first.md 和 docs/second.md。"
+            + "验收标准和固定验证要求。" * 15
+        )
+        with self.assertRaisesRegex(ValueError, "multiple explicit allowed docs paths"):
+            coordinator.declared_docs_path(body)
+
     def test_rejects_automatic_merge(self):
         import json
 
