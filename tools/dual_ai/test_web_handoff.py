@@ -5,7 +5,7 @@ import unittest
 
 from tools.dual_ai.web_batch import HumanRequired
 from tools.dual_ai.web_handoff import (
-    encode_payload, payload_frame, decode_payload, FENCE,
+    encode_payload, payload_frame, decode_payload, FENCE, text_pages, bounded_comment,
 )
 
 
@@ -34,10 +34,10 @@ class HandoffTests(unittest.TestCase):
             json.loads(damaged[damaged.index(FENCE + "json\n") + 8:-4])
         self.assertEqual(decode_payload(damaged, parts.__getitem__), data)
 
-    def test_two_chunks_reassemble_and_verify(self):
+    def test_multiple_chunks_reassemble_and_verify(self):
         data = {"text": "中" * 15000}
         body, parts = self.envelope(data)
-        self.assertEqual(len(parts), 2)
+        self.assertEqual(len(parts), 4)
         self.assertEqual(decode_payload(body, parts.__getitem__), data)
 
     def test_tampered_part_is_rejected(self):
@@ -64,7 +64,18 @@ class HandoffTests(unittest.TestCase):
 
     def test_oversize_payload_stops_before_post(self):
         with self.assertRaises(HumanRequired):
-            encode_payload(json.dumps({"text": "x" * 60000}))
+            encode_payload(json.dumps({"text": "x" * 200000}))
+
+    def test_utf8_pages_are_lossless_and_under_comment_budget(self):
+        text = "中文😀\\u001b\\x00\n" * 5000
+        pages = text_pages(text)
+        self.assertEqual("".join(pages), text)
+        self.assertGreater(len(pages), 1)
+        for page in pages:
+            self.assertLessEqual(len(page.encode("utf-8")), 18000)
+            bounded_comment("header\n" + page)
+        with self.assertRaises(HumanRequired):
+            bounded_comment("中" * 9000)
 
 
 if __name__ == "__main__":

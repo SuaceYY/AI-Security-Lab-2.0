@@ -218,6 +218,30 @@ class RuntimeTests(unittest.TestCase):
                 batch.enter_resume()
             batch.api.assert_not_called()
 
+    def test_large_unicode_report_posts_only_under_24kb_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            stored = {}
+            def api(path, *args):
+                if args:
+                    body = next(value[5:] for value in args if value.startswith("body="))
+                    self.assertLessEqual(len(body.encode("utf-8")), 24000)
+                    ref = 100 + len(stored)
+                    stored[ref] = body
+                    return {"id": ref}
+                return {"body": stored[int(path.rsplit("/", 1)[1])]}
+            batch.api = api
+            report = {"batch_id": batch.batch_id, "round": 2, "phase": "development",
+                      "model_result": {"summary": "保留所有证据", "status": "done"},
+                      "source": {"files": {"backend/large.py": {"content": "中文😀" * 6500}}},
+                      "verification": {"ok": False, "steps": [{"output": "log\\u001b" * 3000}]}}
+            with patch(RUNTIME + "DATA", Path(folder)):
+                ref = batch.post(2, "development", report)
+            self.assertEqual(batch.fetch(ref), report)
+            self.assertGreater(len(stored), 4)
+            self.assertIn("readable_pages", stored[ref])
+            self.assertTrue((Path(folder) / batch.batch_id / "report-2-development.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

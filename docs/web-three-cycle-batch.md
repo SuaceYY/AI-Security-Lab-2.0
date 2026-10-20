@@ -66,3 +66,20 @@ python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --status
 ```powershell
 python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --resume-from-report 6298174688 --write
 ```
+
+
+## 24KB 评论与小任务约束
+
+每条新发布评论（含标题、标记、代码围栏与清单）按 UTF-8 实际字节限制为 24000，发布前检查。完整报告先保存本地，较大报告自动拆成可读分页；机器交接仍校验全部分块，兼容读取历史42KB分块。单份完整交接上限192000字节，超过则保留现场交由主审核对。拆分评论不计循环次数。
+
+每次只派发一个最小可验收目标，尽量限定2到3个源码/测试文件。首批第3轮缩小为已过滤文件提交API并展示基础Finding及最小加载/错误反馈，JSON导出与复杂看板留待下一批评估；原大纲与批次计数不变。
+
+固定后端验证优先探测项目已有 .venv、backend/.venv、venv、backend/venv 中的 Python，再检查当前 Python。只复用能够导入 FastAPI 的解释器，并在验证记录中保存解释器路径和版本。不自动安装依赖；若没有现成后端环境则停下询问。
+
+## 第二轮未发布现场恢复
+
+Issue #33 第2轮在系统 Python 缺 FastAPI、后续大报告发布超限后暂停。代码仍在本地 backend 四个文件中。必须先用 git stash push -u 备份已知代码改动，保留完整 stash SHA，再切换并更新工具分支；禁止 reset、clean、丢弃工作区或删除批次状态。
+
+tools.dual_ai.recover_local --batch-id web-s1-b001 --stash <完整SHA> --write 仅接受：原状态为开发阶段报告超预算暂停、完整循环计数为当前轮减一、原 Issue/PR/分支/提交未变化、本轮未发布开发报告或投递GLM、备份基于原提交且不含越界/暂存改动、绑定会话和唯一已完成开发消息一致。
+
+恢复时保留 stash，回到原分支恢复文件，重新运行固定验证；读取原 DeepSeek 消息而不重发开发提示，再将完整证据分段发布后交给 GLM。每批仅允许一次此类显式恢复；没有自动重试或清零计数。恢复失败保留备份和现场。
