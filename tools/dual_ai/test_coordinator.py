@@ -216,5 +216,24 @@ class CoordinatorTests(unittest.TestCase):
         review.assert_not_called()
 
 
+    def test_parse_glm_review_feedback_comment(self):
+        comment = (
+            "<!-- dual-ai-glm-review sha=abc123 -->\n"
+            "### GLM independent review — PR #25\n\n"
+            "**Verdict:** \x60needs_evidence\x60\n\n"
+            "**Reason:** 缺少固定验证命令输出和日志\n"
+        )
+        parsed = coordinator.parse_review_comment(comment)
+        self.assertEqual(
+            parsed,
+            {"status": "needs_evidence", "reason": "缺少固定验证命令输出和日志"},
+        )
+
+    def test_parse_glm_review_feedback_rejects_incomplete_comment(self):
+        self.assertIsNone(
+            coordinator.parse_review_comment("**Verdict:** \x60needs_evidence\x60")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
