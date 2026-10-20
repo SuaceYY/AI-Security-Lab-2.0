@@ -20,7 +20,10 @@ from tools.dual_ai.live_runner import ROOT
 from tools.dual_ai.visible_tui import run_prompt, TUITransportError
 from tools.dual_ai.review_feedback import existing_review, parse_verdict, format_comment, Tee
 
-from tools.issue_claimer.claimer import build_verification_plan, validate_task_paths, commit_changes, push_branch, redact
+from tools.issue_claimer.claimer import (
+    VerificationStep, build_verification_plan, check_staged_secrets, collect_changed_paths,
+    validate_task_paths, commit_changes, push_branch, redact,
+)
 
 REPO = "SuaceYY/AI-Security-Lab-2.0"
 STATE = ROOT / "data" / "dual_ai" / "coordinator.json"
@@ -366,14 +369,23 @@ def dispatch_review_feedback(pr_number: int, sha: str, state: dict) -> None:
         )
         run_visible_role("executor", prompt, timeout=600)
 
-        status = _git_text("status", "--porcelain=v1", "--untracked-files=all")
-        changed = sorted({line[3:] for line in status.splitlines() if len(line) >= 4})
+        if _git_text("branch", "--show-current") != branch or _git_text("rev-parse", "HEAD") != sha:
+            raise RuntimeError("DeepSeek changed the branch or commit; refusing review handoff")
+        changed = collect_changed_paths()
         if not set(changed).issubset(allowed_paths):
             raise RuntimeError("DeepSeek changed files outside the original PR scope")
         if changed:
             validate_task_paths(changed)
             _git_text("diff", "--check")
-            steps, plan_error = build_verification_plan(changed)
+            if all(path.startswith("tools/dual_ai/") and path.endswith(".py") for path in changed):
+                steps = [VerificationStep(
+                    "dual_ai_unittests",
+                    (sys.executable, "-m", "unittest", "discover", "-s", "tools/dual_ai", "-p", "test_*.py", "-v"),
+                    ROOT,
+                )]
+                plan_error = ""
+            else:
+                steps, plan_error = build_verification_plan(changed)
         else:
             steps, plan_error = build_verification_plan(sorted(allowed_paths))
         if plan_error:
@@ -401,6 +413,8 @@ def dispatch_review_feedback(pr_number: int, sha: str, state: dict) -> None:
             staged = set(filter(None, _git_text("diff", "--cached", "--name-only").splitlines()))
             if staged != set(changed):
                 raise RuntimeError("staged file set changed; refusing commit")
+            check_staged_secrets()
+            _git_text("diff", "--cached", "--check")
             new_sha = commit_changes(issue_number, str(pr.get("title") or "review repair"))
             push_branch(branch)
 
