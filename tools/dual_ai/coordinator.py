@@ -255,6 +255,20 @@ def _git_text(*args: str, timeout: int = 30) -> str:
     return proc.stdout.strip()
 
 
+def review_verification_plan(changed_paths: list[str]):
+    """Choose only fixed, repository-owned verification commands."""
+    if changed_paths and all(
+        path.startswith("tools/dual_ai/") and path.endswith(".py")
+        for path in changed_paths
+    ):
+        return [VerificationStep(
+            "dual_ai_unittests",
+            (sys.executable, "-m", "unittest", "discover", "-s", "tools/dual_ai", "-p", "test_*.py", "-v"),
+            ROOT,
+        )], ""
+    return build_verification_plan(changed_paths)
+
+
 def parse_review_comment(body: str) -> dict | None:
     status = re.search(r"(?m)^\*\*Verdict:\*\* \x60(needs_evidence|changes_requested|ready_for_human)\x60$", body)
     reason = re.search(r"(?m)^\*\*Reason:\*\* (.+)$", body)
@@ -377,15 +391,7 @@ def dispatch_review_feedback(pr_number: int, sha: str, state: dict) -> None:
         if changed:
             validate_task_paths(changed)
             _git_text("diff", "--check")
-            if all(path.startswith("tools/dual_ai/") and path.endswith(".py") for path in changed):
-                steps = [VerificationStep(
-                    "dual_ai_unittests",
-                    (sys.executable, "-m", "unittest", "discover", "-s", "tools/dual_ai", "-p", "test_*.py", "-v"),
-                    ROOT,
-                )]
-                plan_error = ""
-            else:
-                steps, plan_error = build_verification_plan(changed)
+            steps, plan_error = review_verification_plan(changed)
         else:
             steps, plan_error = build_verification_plan(sorted(allowed_paths))
         if plan_error:
