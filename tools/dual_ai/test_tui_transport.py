@@ -97,3 +97,14 @@ class TUITransportTests(unittest.TestCase):
         })
         self.assertEqual(args[2]["parts"], [{"type": "text", "text": "authorized task"}])
         self.assertEqual(kwargs["timeout"], 905)
+
+    def test_missing_session_status_means_idle(self):
+        client = TUIClient("http://127.0.0.1:4311", Path.cwd())
+        client._request = Mock(return_value={})
+        self.assertEqual(client.get_session_status("ses_planner"), "idle")
+        client._request.assert_called_once_with("GET", "/session/status")
+
+    def test_busy_session_status_is_preserved(self):
+        client = TUIClient("http://127.0.0.1:4311", Path.cwd())
+        client._request = Mock(return_value={"ses_planner": {"type": "busy"}})
+        self.assertEqual(client.get_session_status("ses_planner"), "busy")
