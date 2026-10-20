@@ -1,9 +1,8 @@
-"""Bounded GitHub GLM planner -> DeepSeek Issue Claimer -> GLM reviewer loop.
+"""Bounded GitHub GLM planner -> DeepSeek worker -> GLM reviewer loop.
 
-GitHub is the durable handoff. The existing Issue Claimer runs separately and
-owns DeepSeek execution; this coordinator NEVER runs a second executor.
-Default is dry-run. --write enables GitHub Issue creation and review comments.
-No auto-merge, no retries of historical failed issues.
+GitHub is the durable handoff. Review repairs are sent to the already-bound
+visible DeepSeek session; no second executor is launched. Default is dry-run.
+--write enables GitHub writes. There is no auto-merge or historical retry.
 """
 from __future__ import annotations
 
@@ -291,7 +290,7 @@ def dispatch_review_feedback(pr_number: int, sha: str, state: dict) -> None:
         return
     handoffs = state.setdefault("feedback_handoffs", {})
     entry = handoffs.setdefault(str(pr_number), {"rounds": 0, "completed_shas": []})
-    if sha in entry.get("completed_shas", []):
+    if comment_id is not None and comment_id in entry.get("completed_review_ids", []):
         return
     if int(entry.get("rounds", 0)) >= MAX_ROUNDS:
         entry["status"] = "round_limit_reached"
@@ -427,7 +426,8 @@ def dispatch_review_feedback(pr_number: int, sha: str, state: dict) -> None:
             if marker in old_body:
                 gh("api", f"repos/{REPO}/issues/comments/{comment_id}", "-X", "PATCH", "-f",
                    "body=" + old_body.replace(marker, f"<!-- dual-ai-glm-feedback-handed-off sha={sha} -->"))
-        entry.setdefault("completed_shas", []).append(sha)
+        if comment_id is not None:
+            entry.setdefault("completed_review_ids", []).append(comment_id)
         entry["status"] = "handed_off"
         entry["updated_sha"] = new_sha
         save_state(state)
