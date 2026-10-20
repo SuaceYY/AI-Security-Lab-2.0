@@ -76,6 +76,11 @@ class ScanTextTests(unittest.TestCase):
         text = '# eval(user_input)\n// eval(user_input)\n* exec(payload)\n'
         self.assertEqual(scan_text("src/app.py", text), [])
 
+    def test_leading_star_comment_heuristic_skips_entire_line(self):
+        findings = scan_text("src/app.py", "* eval(user_input)\n")
+
+        self.assertEqual(findings, [])
+
     def test_blank_lines_are_skipped(self):
         self.assertEqual(scan_text("src/app.py", "\n\n   \n"), [])
 
