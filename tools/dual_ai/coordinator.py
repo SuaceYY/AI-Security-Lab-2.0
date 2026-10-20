@@ -148,7 +148,20 @@ def create_next_issue(*, write: bool, state: dict) -> None:
             print(f"[GitHub] Existing Issue #{issue['number']} recovered.")
             return
     # Create without ai-ready first: worker cannot claim partially prepared Issue.
-    body = marker + "\n\n" + task["body"] + "\n\nAI-generated task; human PR review required."
+    # Canonical single-file instruction recognized by the existing Worker scope gate.
+    allowed = re.search(
+        r"允许修改路径[：:]\s*(?:仅\s*)?`?(docs/[a-zA-Z0-9_./-]+)",
+        task["body"],
+    )
+    if not allowed:
+        raise ValueError("missing allowed docs path at Issue creation")
+    allowed_path = allowed.group(1).rstrip("`.,，。；;")
+    body = (
+        marker + "\n\n"
+        + f"仅新增 `{allowed_path}`\n\n"
+        + task["body"]
+        + "\n\nAI-generated task; human PR review required."
+    )
     url = gh("issue", "create", "--title", task["title"], "--body", body)
     number_match = re.search(r"/issues/(\d+)", url)
     if not number_match:
