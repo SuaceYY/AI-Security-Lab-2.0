@@ -10,7 +10,7 @@ import argparse
 import json
 import re
 
-from tools.dual_ai.coordinator import gh, load_state, save_state
+from tools.dual_ai.coordinator import gh, load_state, save_state, linked_to_issue
 from tools.dual_ai.github_evidence import gh_json
 from tools.dual_ai.live_runner import ROOT
 
