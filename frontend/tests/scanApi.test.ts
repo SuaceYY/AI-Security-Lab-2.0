@@ -51,6 +51,20 @@ function successfulFetch(payload: unknown): typeof fetch {
   })) as unknown as typeof fetch
 }
 
+function failedFetch(status: number, payload: unknown): typeof fetch {
+  return (async () => ({
+    ok: false,
+    status,
+    json: async () => payload,
+  })) as unknown as typeof fetch
+}
+
+function withoutField<T extends object>(value: T, field: keyof T): unknown {
+  const copy: Partial<T> = { ...value }
+  delete copy[field]
+  return copy
+}
+
 async function expectInvalidResponse(label: string, payload: unknown): Promise<void> {
   await assert.rejects(
     submitScan([], successfulFetch(payload)),
@@ -208,6 +222,14 @@ test('拒绝畸形 HTTP 200 响应', async () => {
         files: [{ file_path: 'project/src/app.py', status: 'scanned', finding_count: 1 }],
       },
     ],
+    [
+      'files 缺少 file_path',
+      { ...VALID_RESPONSE, files: [withoutField(VALID_RESPONSE.files[0], 'file_path')] },
+    ],
+    [
+      'files 缺少 finding_count',
+      { ...VALID_RESPONSE, files: [withoutField(VALID_RESPONSE.files[0], 'finding_count')] },
+    ],
     ['findings 含 null', { ...VALID_RESPONSE, findings: [null] }],
     [
       'findings 严重度非法',
@@ -215,6 +237,22 @@ test('拒绝畸形 HTTP 200 响应', async () => {
         ...VALID_RESPONSE,
         findings: [{ ...VALID_RESPONSE.findings[0], severity: 'critical' }],
       },
+    ],
+    [
+      'findings 缺少 rule_id',
+      { ...VALID_RESPONSE, findings: [withoutField(VALID_RESPONSE.findings[0], 'rule_id')] },
+    ],
+    [
+      'findings 缺少 file_path',
+      { ...VALID_RESPONSE, findings: [withoutField(VALID_RESPONSE.findings[0], 'file_path')] },
+    ],
+    [
+      'findings 缺少 evidence',
+      { ...VALID_RESPONSE, findings: [withoutField(VALID_RESPONSE.findings[0], 'evidence')] },
+    ],
+    [
+      'findings 缺少 explanation',
+      { ...VALID_RESPONSE, findings: [withoutField(VALID_RESPONSE.findings[0], 'explanation')] },
     ],
     [
       'findings 行号为 0',
@@ -251,4 +289,59 @@ test('拒绝畸形 HTTP 200 响应', async () => {
   for (const [label, payload] of malformedResponses) {
     await expectInvalidResponse(label, payload)
   }
+})
+
+test('保留失败 HTTP 与网络异常的既有行为', async () => {
+  const httpFailures: Array<[number, unknown, string | undefined, string]> = [
+    [
+      400,
+      {
+        detail: {
+          status: 'failed',
+          code: 'sensitive_file',
+          message: '敏感文件：环境变量配置：.env',
+        },
+      },
+      'sensitive_file',
+      '文件包含敏感路径或凭据，服务端已拒绝请求。',
+    ],
+    [
+      422,
+      {
+        detail: {
+          status: 'failed',
+          code: 'invalid_request',
+          message: '请求格式不合法。',
+        },
+      },
+      'invalid_request',
+      '请求格式不合法，请重新选择文件后重试。',
+    ],
+    [500, null, undefined, '扫描失败（HTTP 500）。'],
+  ]
+
+  for (const [status, payload, code, message] of httpFailures) {
+    await assert.rejects(
+      submitScan([], failedFetch(status, payload)),
+      (error: unknown) => {
+        assert.ok(error instanceof ScanRequestError)
+        assert.equal(error.status, status)
+        assert.equal(error.code, code)
+        assert.equal(formatScanError(error), message)
+        return true
+      },
+    )
+  }
+
+  await assert.rejects(
+    submitScan([], (async () => {
+      throw new Error('网络不可用。')
+    }) as unknown as typeof fetch),
+    (error: unknown) => {
+      assert.ok(error instanceof ScanRequestError)
+      assert.equal(error.status, 0)
+      assert.equal(formatScanError(error), '无法连接扫描服务：网络不可用。')
+      return true
+    },
+  )
 })
