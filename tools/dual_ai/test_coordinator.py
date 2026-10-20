@@ -39,10 +39,11 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.save_state({"created": [42], "phase": "waiting_for_worker"}, path)
             self.assertEqual(coordinator.load_state(path)["created"], [42])
 
+    @patch.object(coordinator, "gh_json", return_value=[])
     @patch.object(coordinator, "review_new_pr")
     @patch.object(coordinator, "create_next_issue")
     @patch.object(coordinator, "load_state")
-    def test_does_not_create_again(self, load, create, review):
+    def test_does_not_create_again(self, load, create, review, github):
         load.return_value = {"created": [42]}
         coordinator.tick(write=False)
         create.assert_not_called()
