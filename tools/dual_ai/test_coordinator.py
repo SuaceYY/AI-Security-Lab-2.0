@@ -23,7 +23,7 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.task_from_output(line)
 
     @patch.object(coordinator, "gh_json", return_value=[
-        {"number": 25, "body": "Closes #42", "mergedAt": "2026-10-20T00:00:00Z"}
+        {"number": 25, "body": "Automated implementation for issue #42.", "mergedAt": "2026-10-20T00:00:00Z"}
     ])
     @patch.object(coordinator, "review_new_pr")
     @patch.object(coordinator, "create_next_issue")
@@ -32,6 +32,14 @@ class CoordinatorTests(unittest.TestCase):
         coordinator.tick(write=False)
         create.assert_called_once()
         review.assert_not_called()
+
+    def test_worker_pr_link(self):
+        self.assertTrue(coordinator.linked_to_issue(
+            "Automated implementation for issue #42.\\n\\n- Branch: ai/issue-42", 42))
+        self.assertTrue(coordinator.linked_to_issue("Closes #42", 42))
+        self.assertFalse(coordinator.linked_to_issue(
+            "Automated implementation for issue #420.", 42))
+        self.assertFalse(coordinator.linked_to_issue("Unrelated PR", 42))
 
     def test_state_round_trip(self):
         with tempfile.TemporaryDirectory() as folder:
