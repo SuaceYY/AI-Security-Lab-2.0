@@ -30,19 +30,20 @@ class VisibleTUITests(unittest.TestCase):
         root = Path.cwd()
         binding = Path("binding.json")
         with patch.object(Path, "read_text", return_value=self.binding_text()):
-            user = {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "task"}]}
-            assistant = {"info": {"id": "a1", "role": "assistant", "providerID": "provider", "modelID": "glm"}, "parts": [{"type": "text", "text": "done"}]}
+            assistant = {"info": {"id": "a1", "role": "assistant", "sessionID": "ses_planner", "providerID": "provider", "modelID": "glm"}, "parts": [{"type": "text", "text": "done"}]}
             client = Mock()
             client.inspect.return_value = {"directory": str(root)}
             client.get_session.return_value = {"id": "ses_planner"}
-            client.get_session_status.side_effect = ["idle", "idle"]
-            client.get_messages.side_effect = [[], [user, assistant]]
+            client.get_session_status.return_value = "idle"
+            client.send_session_message.return_value = assistant
             factory = Mock(return_value=client)
             text, session = visible_tui.run_prompt("planner", "task", root=root,
                                                    binding_file=binding, output=Mock(),
                                                    client_factory=factory)
             self.assertEqual((text, session), ("done", "ses_planner"))
-            client.send_prompt.assert_called_once_with("task")
+            client.send_session_message.assert_called_once_with(
+                "ses_planner", "task", "provider/glm", timeout=305
+            )
 
     def test_non_idle_session_is_not_sent(self):
         root = Path.cwd()
