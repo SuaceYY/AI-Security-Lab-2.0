@@ -1,4 +1,10 @@
-﻿"""Local GitHub issue claimer for AI-Security-Lab 2.0."""
+﻿"""Local GitHub issue claimer for AI-Security-Lab 2.0.
+
+Security model: use only trusted issues under human supervision. This tool is
+not an OS-level sandbox and does not claim to isolate OpenCode from the rest of
+the machine. OpenCode auto-approval and custom verification commands are not
+supported.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -26,6 +31,8 @@ DATA_DIR = Path(
     os.environ.get("ISSUE_CLAIMER_DATA_DIR", str(PROJECT_ROOT / "data" / "issue_claimer"))
 ).resolve()
 STATE_FILE = DATA_DIR / "state.json"
+STATUS_FILE = DATA_DIR / "status.json"
+HANDOFF_FILE = DATA_DIR / "handoff.md"
 LOCK_FILE = DATA_DIR / "claimer.lock"
 PID_FILE = DATA_DIR / "claimer.pid"
 STOP_FILE = DATA_DIR / "stop.flag"
@@ -43,6 +50,10 @@ LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 ISSUE_BODY_LIMIT = 12000
 ERROR_DETAIL_LIMIT = 2000
+CHECKPOINT_DETAIL_LIMIT = 500
+HANDOFF_MAX_CHARS = 4000
+MAX_STAGED_FILES = 100
+MAX_STAGED_BYTES = 5 * 1024 * 1024
 
 TERMINAL_STATUSES = {"succeeded", "failed", "timed_out"}
 SENSITIVE_DIRECTORIES = {
@@ -55,18 +66,25 @@ SENSITIVE_DIRECTORIES = {
     "out",
     "__pycache__",
     "data",
+    "logs",
     ".ssh",
     ".aws",
     ".gnupg",
     ".docker",
     ".kube",
     ".azure",
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
 }
 PROTECTED_PATHS = {
     "tools/issue_claimer",
 }
 SENSITIVE_NAME_PATTERN = re.compile(
-    r"(?i)(^\.env($|\.)|\.envrc$|\.(pem|key|p12|pfx|crt|cer|der|csr|jks|keystore|ppk|kdbx|ovpn|tfvars|tfstate|pgpass)$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret|^\.npmrc$|^\.pypirc$|^\.netrc$|^_netrc$|^\.git-credentials$|^\.htpasswd$|service[-_]?account.*\.json$)"
+    r"(?i)(^\.env($|\.)|\.envrc$|\.(pem|key|p12|pfx|crt|cer|der|csr|jks|keystore|ppk|kdbx|ovpn|tfvars|tfstate|pgpass)$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret|^\.npmrc$|^\.pypirc$|^\.netrc$|^_netrc$|^\.git-credentials$|^\.htpasswd$|service[-_]?account.*\.json$|^(claimer\.(log|pid|lock)|state\.json|status\.json|handoff\.md|stop\.flag)$)"
 )
 SECRET_CONTENT_PATTERNS = [
     ("private key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")),
@@ -93,6 +111,23 @@ SENSITIVE_ENV_NAMES = {
     "KUBECONFIG",
     "DOCKER_CONFIG",
 }
+CONTEXT_ERROR_PATTERN = re.compile(
+    r"(?i)(context (window|length)|token limit|too many tokens|"
+    r"maximum context|context overflow|compact(ion)? required)"
+)
+VERIFICATION_COMMANDS = (
+    (
+        sys.executable,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/issue_claimer/tests",
+        "-p",
+        "test_*.py",
+        "-v",
+    ),
+)
 
 
 class TaskError(RuntimeError):
@@ -117,6 +152,12 @@ class CommandResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and not self.timed_out
+
+
+@dataclass
+class VerificationResult:
+    ok: bool
+    detail: str
 
 
 def utc_now() -> str:
@@ -233,7 +274,15 @@ def git(args: list[str], timeout: int = 120) -> CommandResult:
     hooks_dir = DATA_DIR / "empty-hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     return run_command(
-        ["git", "-c", f"core.hooksPath={hooks_dir.as_posix()}", *args],
+        [
+            "git",
+            "-c",
+            f"core.hooksPath={hooks_dir.as_posix()}",
+            "-c",
+            "core.fsmonitor=false",
+            "--literal-pathspecs",
+            *args,
+        ],
         timeout=timeout,
     )
 
@@ -376,15 +425,88 @@ def load_state() -> dict[str, Any]:
     return data
 
 
+def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
 def save_state(state: dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
-    temporary = STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(
+    atomic_write(
+        STATE_FILE,
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
     )
-    os.replace(temporary, STATE_FILE)
+
+
+def write_checkpoint(
+    task: dict[str, Any],
+    stage: str,
+    next_step: str,
+    tests: str = "not_run",
+    recovery: str = "",
+) -> None:
+    payload = {
+        "issue_number": task.get("issue_number"),
+        "title": trim(str(task.get("title") or ""), 200),
+        "status": task.get("status"),
+        "stage": trim(stage, 80),
+        "branch": task.get("branch"),
+        "commit_sha": task.get("commit_sha"),
+        "pr_url": task.get("pr_url"),
+        "tests": trim(tests, 300),
+        "next_step": trim(next_step, CHECKPOINT_DETAIL_LIMIT),
+        "recovery": trim(recovery, CHECKPOINT_DETAIL_LIMIT),
+        "updated_at": utc_now(),
+    }
+    if task.get("failure_reason"):
+        payload["failure_reason"] = trim(str(task["failure_reason"]))
+    try:
+        atomic_write(
+            STATUS_FILE,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+    except OSError as exc:
+        logging.getLogger("issue_claimer").warning(
+            "cannot write status checkpoint: %s", exc
+        )
+
+    lines = [
+        "# Issue Claimer Handoff",
+        "",
+        f"Updated: {payload['updated_at']}",
+        "",
+        f"- Issue: #{payload['issue_number']} {payload['title']}",
+        f"- Status: {payload['status']}",
+        f"- Stage: {payload['stage']}",
+        f"- Branch: {payload['branch'] or '(none)'}",
+        f"- Commit: {payload['commit_sha'] or '(none)'}",
+        f"- PR: {payload['pr_url'] or '(none)'}",
+        f"- Tests: {payload['tests']}",
+        f"- Next step: {payload['next_step']}",
+    ]
+    if payload["recovery"]:
+        lines.append(f"- Recovery: {payload['recovery']}")
+    if payload.get("failure_reason"):
+        lines.append(f"- Failure: {payload['failure_reason']}")
+    lines.append("")
+    handoff = redact("\n".join(lines))
+    try:
+        atomic_write(HANDOFF_FILE, handoff[:HANDOFF_MAX_CHARS])
+    except OSError as exc:
+        logging.getLogger("issue_claimer").warning(
+            "cannot write handoff checkpoint: %s", exc
+        )
 
 
 def finalize_first_run(state: dict[str, Any]) -> None:
@@ -599,6 +721,8 @@ def check_sensitive_paths(paths: list[str]) -> None:
         normalized = path.replace("\\", "/").strip("/")
         if not normalized or normalized.startswith("../") or "/../" in normalized:
             raise TaskError(f"unsafe path in planned commit: {path}")
+        if "\n" in normalized or "\r" in normalized:
+            raise TaskError("unsafe control character in planned commit path")
         if any(
             normalized == protected or normalized.startswith(protected + "/")
             for protected in PROTECTED_PATHS
@@ -612,12 +736,74 @@ def check_sensitive_paths(paths: list[str]) -> None:
             raise TaskError(f"planned commit contains sensitive filename: {path}")
 
 
+def validate_task_paths(paths: list[str]) -> None:
+    if not paths:
+        raise TaskError("task produced no file changes")
+    if len(paths) > MAX_STAGED_FILES:
+        raise TaskError(
+            f"task produced too many changed files ({len(paths)} > {MAX_STAGED_FILES})"
+        )
+
+    check_sensitive_paths(paths)
+    total_bytes = 0
+    for path in paths:
+        candidate = (PROJECT_ROOT / path).resolve()
+        if candidate != PROJECT_ROOT and PROJECT_ROOT not in candidate.parents:
+            raise TaskError(f"planned commit escapes the repository: {path}")
+        if candidate.is_symlink():
+            raise TaskError(f"planned commit contains a symlink: {path}")
+        if candidate.is_file():
+            total_bytes += candidate.stat().st_size
+            if total_bytes > MAX_STAGED_BYTES:
+                raise TaskError(
+                    f"task changes exceed the {MAX_STAGED_BYTES}-byte staging limit"
+                )
+
+
+def collect_changed_paths() -> list[str]:
+    result = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    if result.returncode != 0:
+        raise TaskError(f"inspect task changes failed: {trim(result.stderr)}")
+    items = result.stdout.split("\x00")
+    paths: list[str] = []
+    index = 0
+    while index < len(items):
+        entry = items[index]
+        if len(entry) < 4:
+            index += 1
+            continue
+        status_code = entry[:2]
+        path = entry[3:]
+        if ("R" in status_code or "C" in status_code) and index + 1 < len(items):
+            paths.extend([path, items[index + 1]])
+            index += 2
+            continue
+        paths.append(path)
+        index += 1
+    return sorted({path for path in paths if path})
+
+
+def ensure_task_repository_state(expected_branch: str, base_sha: str) -> None:
+    branch = require_ok(git(["branch", "--show-current"]), "read current branch")
+    if branch != expected_branch:
+        raise TaskError(
+            f"task changed the current branch ({branch!r} != {expected_branch!r})"
+        )
+    head = require_ok(git(["rev-parse", "HEAD"]), "read current commit")
+    if head != base_sha:
+        raise TaskError("task changed repository history; refusing to continue")
+    staged = git(["diff", "--cached", "--name-only", "-z"])
+    if staged.returncode != 0:
+        raise TaskError(f"inspect staged files failed: {trim(staged.stderr)}")
+    if staged.stdout.strip("\x00"):
+        raise TaskError("task staged files itself; refusing to continue")
+
+
 def staged_paths() -> list[str]:
-    output = require_ok(
-        git(["diff", "--cached", "--name-only", "-z"]),
-        "list staged files",
-    )
-    return [item for item in output.split("\x00") if item]
+    result = git(["diff", "--cached", "--name-only", "-z"])
+    if result.returncode != 0:
+        raise TaskError(f"list staged files failed: {trim(result.stderr)}")
+    return [item for item in result.stdout.split("\x00") if item]
 
 
 def check_staged_secrets() -> None:
@@ -627,25 +813,16 @@ def check_staged_secrets() -> None:
             raise TaskError(f"staged diff contains a possible {label}")
 
 
-def stage_and_validate_changes() -> None:
-    status = require_ok(
-        git(["status", "--porcelain", "--untracked-files=all"]),
-        "inspect task changes",
-    )
-    changed: list[str] = []
-    for line in status.splitlines():
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        if path:
-            changed.append(path)
-    if not changed:
-        raise TaskError("task produced no file changes")
-
-    check_sensitive_paths(changed)
-    require_ok(git(["add", "--all"]), "stage task changes")
-    paths = staged_paths()
-    check_sensitive_paths(paths)
+def stage_and_validate_changes(paths: list[str]) -> None:
+    validate_task_paths(paths)
+    require_ok(git(["add", "--", *paths]), "stage task changes")
+    staged = staged_paths()
+    if not staged:
+        raise TaskError("task produced no staged changes")
+    validate_task_paths(staged)
+    unexpected = sorted(set(staged) - set(paths))
+    if unexpected:
+        raise TaskError(f"unexpected staged paths: {', '.join(unexpected[:10])}")
     check_staged_secrets()
     require_ok(git(["diff", "--cached", "--check"]), "check staged diff")
 
@@ -746,8 +923,6 @@ def sanitized_opencode_env() -> dict[str, str]:
     for key in list(env):
         if key.upper() in SENSITIVE_ENV_NAMES or SENSITIVE_ENV_PATTERN.search(key):
             env.pop(key, None)
-    env.pop("ISSUE_CLAIMER_VERIFY_COMMAND", None)
-    env.pop("ISSUE_CLAIMER_OPENCODE_AUTO", None)
     return env
 
 
@@ -797,6 +972,7 @@ def run_opencode(
     command = [
         "opencode",
         "run",
+        "--pure",
         "--dir",
         str(PROJECT_ROOT),
         "--title",
@@ -808,11 +984,6 @@ def run_opencode(
     agent = os.environ.get("ISSUE_CLAIMER_OPENCODE_AGENT", "").strip()
     if agent:
         command.extend(["--agent", agent])
-    if os.environ.get("ISSUE_CLAIMER_OPENCODE_AUTO", "").lower() in {"1", "true", "yes"}:
-        logging.getLogger("issue_claimer").warning(
-            "OpenCode auto-approval is enabled; the agent may run local tools without confirmation"
-        )
-        command.append("--auto")
     command.append(build_prompt(issue, attempt, previous_error))
 
     logging.getLogger("issue_claimer").info(
@@ -826,25 +997,71 @@ def run_opencode(
     )
 
 
-def run_verification(timeout: int) -> CommandResult | None:
-    command = os.environ.get("ISSUE_CLAIMER_VERIFY_COMMAND", "").strip()
-    if not command:
-        return None
-    args = shlex.split(command, posix=(os.name != "nt"))
-    if os.name == "nt":
-        args = [
-            item[1:-1] if len(item) >= 2 and item[0] == item[-1] == '"' else item
-            for item in args
-        ]
-    if not args:
-        return None
-    logging.getLogger("issue_claimer").info("running configured verification command")
-    return run_command(
-        args,
-        cwd=PROJECT_ROOT,
-        timeout=timeout,
-        env=sanitized_opencode_env(),
+def context_exhausted(result: CommandResult) -> bool:
+    return bool(
+        CONTEXT_ERROR_PATTERN.search(
+            f"{result.stderr or ''}\n{result.stdout or ''}"
+        )
     )
+
+
+def recovery_command() -> str:
+    return f'opencode run --dir "{PROJECT_ROOT}" --continue'
+
+
+def run_verification(
+    changed_paths: list[str],
+    timeout: int,
+) -> VerificationResult:
+    if not VERIFICATION_COMMANDS:
+        return VerificationResult(False, "no fixed verification commands are configured")
+
+    deadline = time.monotonic() + timeout
+    logger = logging.getLogger("issue_claimer")
+    for command in VERIFICATION_COMMANDS:
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            return VerificationResult(False, "verification exceeded its timeout")
+        logger.info("running fixed verification command: %s", command[0])
+        result = run_command(
+            list(command),
+            cwd=PROJECT_ROOT,
+            timeout=remaining,
+            env=sanitized_opencode_env(),
+        )
+        if result.timed_out:
+            return VerificationResult(False, "verification command timed out")
+        if result.returncode != 0:
+            return VerificationResult(
+                False,
+                f"verification failed: {trim(result.stderr or result.stdout)}",
+            )
+
+    for path in changed_paths:
+        if not path.endswith(".py"):
+            continue
+        candidate = PROJECT_ROOT / path
+        if not candidate.is_file():
+            continue
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            return VerificationResult(False, "verification exceeded its timeout")
+        logger.info("compiling changed Python file: %s", path)
+        result = run_command(
+            [sys.executable, "-m", "py_compile", path],
+            cwd=PROJECT_ROOT,
+            timeout=min(remaining, 120),
+            env=sanitized_opencode_env(),
+        )
+        if result.timed_out:
+            return VerificationResult(False, f"compile timed out: {path}")
+        if result.returncode != 0:
+            return VerificationResult(
+                False,
+                f"compile failed for {path}: {trim(result.stderr or result.stdout)}",
+            )
+
+    return VerificationResult(True, "fixed verification commands passed")
 
 
 def switch_back(original_branch: str) -> None:
@@ -869,16 +1086,20 @@ def process_issue(issue: dict[str, Any]) -> None:
         "issue_number": number,
         "title": title,
         "status": "running",
+        "stage": "claimed",
         "branch": branch,
         "commit_sha": None,
         "pr_url": None,
         "attempts": 0,
+        "tests": "not_run",
+        "next_step": "create task branch",
         "started_at": utc_now(),
         "updated_at": utc_now(),
         "failure_reason": None,
     }
     state["tasks"][str(number)] = task
     save_state(state)
+    write_checkpoint(task, "claimed", task["next_step"])
     logger.info("claimed issue #%s on branch %s", number, branch)
 
     task_deadline = time.monotonic() + TASK_TIMEOUT_SECONDS
@@ -895,12 +1116,20 @@ def process_issue(issue: dict[str, Any]) -> None:
             git(["switch", "-c", branch, f"origin/{BASE_BRANCH}"], timeout=120),
             "create task branch",
         )
+        base_sha = require_ok(git(["rev-parse", "HEAD"]), "read base commit")
+        task["stage"] = "branch_created"
+        task["next_step"] = "run OpenCode and fixed verification"
+        save_state(state)
+        write_checkpoint(task, task["stage"], task["next_step"])
 
         previous_error = ""
+        changed: list[str] = []
         for attempt in range(1, MAX_ATTEMPTS + 1):
             task["attempts"] = attempt
+            task["stage"] = f"opencode_attempt_{attempt}"
             task["updated_at"] = utc_now()
             save_state(state)
+            write_checkpoint(task, task["stage"], "wait for OpenCode to finish")
 
             remaining = int(task_deadline - time.monotonic())
             if remaining <= 0:
@@ -913,6 +1142,12 @@ def process_issue(issue: dict[str, Any]) -> None:
                 raise TaskTimeout(
                     f"OpenCode exceeded the {TASK_TIMEOUT_SECONDS}-second task timeout"
                 )
+            if context_exhausted(result):
+                task["next_step"] = "inspect changes, then resume manually"
+                raise StopWorker(
+                    "OpenCode reported context exhaustion; automatic session resume is "
+                    f"not enabled. Recover with: {recovery_command()}"
+                )
             if result.returncode != 0:
                 previous_error = (
                     f"OpenCode exited with code {result.returncode}: "
@@ -921,64 +1156,103 @@ def process_issue(issue: dict[str, Any]) -> None:
                 logger.warning("attempt %s failed: %s", attempt, trim(previous_error, 500))
                 continue
 
-            status = git(["status", "--porcelain", "--untracked-files=all"])
-            if status.returncode != 0:
-                previous_error = f"cannot inspect changes: {trim(status.stderr)}"
-                continue
-            if not status.stdout.strip():
-                previous_error = "OpenCode completed without producing file changes."
-                logger.warning("attempt %s produced no changes", attempt)
-                continue
+            ensure_task_repository_state(branch, base_sha)
+            changed = collect_changed_paths()
+            validate_task_paths(changed)
 
             remaining = int(task_deadline - time.monotonic())
             if remaining <= 0:
                 raise TaskTimeout(
                     f"task exceeded the {TASK_TIMEOUT_SECONDS}-second overall timeout before verification"
                 )
-            verification = run_verification(min(remaining, VERIFY_TIMEOUT_SECONDS))
-            if verification and not verification.ok:
-                previous_error = (
-                    "Local verification failed: "
-                    f"{trim(verification.stderr or verification.stdout)}"
-                )
+            verification = run_verification(
+                changed,
+                min(remaining, VERIFY_TIMEOUT_SECONDS),
+            )
+            task["tests"] = verification.detail
+            if not verification.ok:
+                previous_error = f"Fixed verification failed: {verification.detail}"
+                task["stage"] = f"verification_failed_attempt_{attempt}"
+                task["next_step"] = "repair changes or stop for manual review"
+                save_state(state)
+                write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
                 logger.warning("attempt %s verification failed", attempt)
                 continue
 
+            task["stage"] = f"verified_attempt_{attempt}"
+            task["next_step"] = "stage and commit verified changes"
+            save_state(state)
+            write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
             break
         else:
             raise TaskError(
                 f"task failed after {MAX_ATTEMPTS} attempts: {trim(previous_error)}"
             )
 
-        stage_and_validate_changes()
+        ensure_task_repository_state(branch, base_sha)
+        stage_and_validate_changes(changed)
+        task["stage"] = "staged"
+        task["next_step"] = "create task commit"
+        save_state(state)
+        write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
+
         sha = commit_changes(number, title)
         task["commit_sha"] = sha
+        task["stage"] = "committed"
+        task["next_step"] = "push branch and open pull request"
         task["updated_at"] = utc_now()
         save_state(state)
+        write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
 
         push_branch(branch)
+        task["stage"] = "pushed"
+        task["next_step"] = "open pull request"
+        save_state(state)
+        write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
+
         pr_url = create_pull_request(number, title, branch, sha)
         task["pr_url"] = pr_url
         task["status"] = "succeeded"
+        task["stage"] = "succeeded"
+        task["next_step"] = "human review required; automatic merge is disabled"
         task["updated_at"] = utc_now()
         finalize_first_run(state)
         save_state(state)
+        write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
         logger.info("issue #%s succeeded with commit %s and PR %s", number, sha, pr_url)
         switch_back(original_branch)
     except TaskTimeout as exc:
         task["status"] = "timed_out"
+        task["stage"] = "timed_out"
         task["failure_reason"] = str(exc)
+        task["next_step"] = "inspect worktree and resume manually"
         task["updated_at"] = utc_now()
         finalize_first_run(state)
         save_state(state)
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task["tests"],
+            recovery_command(),
+        )
         logger.error("issue #%s timed out: %s", number, exc)
         raise StopWorker(f"task #{number} timed out") from exc
     except (TaskError, StopWorker) as exc:
         task["status"] = "failed"
+        task["stage"] = "failed"
         task["failure_reason"] = trim(str(exc))
+        task["next_step"] = "manual review required; do not rerun automatically"
         task["updated_at"] = utc_now()
         finalize_first_run(state)
         save_state(state)
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task["tests"],
+            recovery_command(),
+        )
         logger.error("issue #%s failed: %s", number, exc)
         if isinstance(exc, StopWorker):
             raise
@@ -998,9 +1272,12 @@ def recover_stale_tasks() -> bool:
 
     for number, task in stale:
         task["status"] = "failed"
+        task["stage"] = "recovery_required"
         task["failure_reason"] = "previous worker stopped before completing the task"
+        task["next_step"] = "inspect worktree and handoff before manual recovery"
         task["updated_at"] = utc_now()
         logger.error("found stale running task #%s; marked as failed", number)
+        write_checkpoint(task, task["stage"], task["next_step"], task.get("tests", "unknown"))
     finalize_first_run(state)
     save_state(state)
     return True
@@ -1161,6 +1438,8 @@ def print_status(as_json: bool) -> int:
         "repo": REPO,
         "project_root": str(PROJECT_ROOT),
         "state_file": str(STATE_FILE),
+        "status_file": str(STATUS_FILE),
+        "handoff_file": str(HANDOFF_FILE),
         "log_file": str(LOG_FILE),
         "first_run_completed": bool(state.get("first_run_completed")),
         "last_poll_at": state.get("last_poll_at"),
@@ -1177,6 +1456,8 @@ def print_status(as_json: bool) -> int:
     print(f"first_run_completed: {payload['first_run_completed']}")
     print(f"last_poll_at: {payload['last_poll_at']}")
     print(f"state_file: {STATE_FILE}")
+    print(f"status_file: {STATUS_FILE}")
+    print(f"handoff_file: {HANDOFF_FILE}")
     print(f"log_file: {LOG_FILE}")
     tasks = payload["tasks"]
     if not tasks:
@@ -1185,9 +1466,14 @@ def print_status(as_json: bool) -> int:
     print("tasks:")
     for number, task in sorted(tasks.items(), key=lambda item: int(item[0])):
         print(
-            f"  #{number} status={task.get('status')} branch={task.get('branch')} "
-            f"sha={task.get('commit_sha')} pr={task.get('pr_url')}"
+            f"  #{number} status={task.get('status')} stage={task.get('stage')} "
+            f"branch={task.get('branch')} sha={task.get('commit_sha')} "
+            f"pr={task.get('pr_url')}"
         )
+        if task.get("tests"):
+            print(f"    tests: {task['tests']}")
+        if task.get("next_step"):
+            print(f"    next: {task['next_step']}")
         if task.get("failure_reason"):
             print(f"    failure: {task['failure_reason']}")
     return 0
@@ -1234,10 +1520,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="issue_claimer.py",
         description="Local GitHub issue claimer for AI-Security-Lab 2.0.",
         epilog=(
-            "Optional environment variables: ISSUE_CLAIMER_VERIFY_COMMAND, "
+            "Runs only trusted issues under human supervision. OpenCode "
+            "auto-approval and custom verification commands are intentionally "
+            "not supported; no OS-level sandbox is claimed. Optional variables: "
             "ISSUE_CLAIMER_OPENCODE_MODEL, ISSUE_CLAIMER_OPENCODE_AGENT, "
-            "ISSUE_CLAIMER_OPENCODE_AUTO=1, ISSUE_CLAIMER_POLL_SECONDS, "
-            "ISSUE_CLAIMER_TASK_TIMEOUT."
+            "ISSUE_CLAIMER_POLL_SECONDS, ISSUE_CLAIMER_TASK_TIMEOUT."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
