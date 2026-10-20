@@ -31,7 +31,7 @@ class VisibleTUITests(unittest.TestCase):
         binding = Path("binding.json")
         with patch.object(Path, "read_text", return_value=self.binding_text()):
             user = {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "task"}]}
-            assistant = {"info": {"id": "a1", "role": "assistant"}, "parts": [{"type": "text", "text": "done"}]}
+            assistant = {"info": {"id": "a1", "role": "assistant", "providerID": "provider", "modelID": "glm"}, "parts": [{"type": "text", "text": "done"}]}
             client = Mock()
             client.inspect.return_value = {"directory": str(root)}
             client.get_session.return_value = {"id": "ses_planner"}
