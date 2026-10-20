@@ -8,7 +8,7 @@ from tools.dual_ai import coordinator
 
 
 class CoordinatorTests(unittest.TestCase):
-        def test_valid_task(self):
+    def test_valid_task(self):
         import json
 
         task = {
