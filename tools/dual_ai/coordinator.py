@@ -67,17 +67,24 @@ def save_state(state: dict, path: Path = STATE) -> None:
 
 def declared_docs_path(body: str) -> str:
     """Return one explicitly declared, single Markdown file under docs/."""
-    path = r"(docs/[a-zA-Z0-9_./-]+)"
-    patterns = (
-        rf"(?:允许修改路径|修改范围|允许修改文件范围)[：:]\s*(?:仅\s*)?(?:新增\s*)?(?:\x60)?{path}",
-        rf"(?:仅新增|只新增|仅修改|只修改)\s*(?:\x60)?{path}",
-        rf"(?:仅|只)\s*(?:\x60)?{path}",
+    path_re = re.compile(r"docs/[a-zA-Z0-9_./-]+")
+    declaration_re = re.compile(
+        r"(?:允许修改路径|修改范围|允许修改文件范围)[：:]"
+        r"|(?:仅新增|只新增|仅修改|只修改)"
+        r"|(?:仅|只)(?=\s*\x60?docs/)"
     )
-    candidates = {
-        match.rstrip(chr(96) + ".,，。；;")
-        for pattern in patterns
-        for match in re.findall(pattern, body)
-    }
+    candidates = set()
+    for declaration in declaration_re.finditer(body):
+        line_end = body.find("\\n", declaration.start())
+        if line_end < 0:
+            line_end = len(body)
+        # Inspect the whole declared line so a list such as
+        # "仅新增 docs/a.md 和 docs/b.md" cannot be truncated to one path.
+        line = body[declaration.start():line_end]
+        candidates.update(
+            match.rstrip(chr(96) + ".,，。；;")
+            for match in path_re.findall(line)
+        )
     if not candidates:
         raise ValueError("missing explicit allowed docs path")
     if len(candidates) != 1:
@@ -85,7 +92,7 @@ def declared_docs_path(body: str) -> str:
     allowed_path = candidates.pop()
     if (
         ".." in allowed_path.split("/")
-        or not re.fullmatch(r"docs/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.md", allowed_path)
+        or not re.fullmatch(r"docs/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.md", allowed_path)
         or allowed_path.startswith("docs//")
     ):
         raise ValueError("invalid allowed docs path")
