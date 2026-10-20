@@ -68,6 +68,8 @@ def task_from_output(output: str) -> dict:
         raise ValueError("invalid body")
     if "docs/" not in task["body"]:
         raise ValueError("first-stage tasks must be docs-scoped")
+    if re.search(r"(?i)(?:tools/issue_claimer|\\.github/|auto.merge|自动合并)", task["body"]):
+        raise ValueError("protected path or merge action in task")
     if not isinstance(task["key"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", task["key"]):
         raise ValueError("invalid key")
     return task
