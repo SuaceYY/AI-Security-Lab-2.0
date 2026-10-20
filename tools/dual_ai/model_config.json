@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "roles": {
+    "planner": {
+      "name": "GLM",
+      "model": "opencode/glm-5.3-flash-free",
+      "session_role": "glm_planner_reviewer"
+    },
+    "executor": {
+      "name": "DeepSeek",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "session_role": "deepseek_executor"
+    }
+  },
+  "policy": {
+    "github_as_handoff": true,
+    "distinct_sessions_required": true,
+    "manual_merge_required": true,
+    "max_review_rounds": 3,
+    "auto_merge": false
+  }
+}
