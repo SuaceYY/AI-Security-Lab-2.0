@@ -51,3 +51,13 @@ class ClaimerRegressionTests(TestCase):
     def test_invalid_session_rejected_before_execution(self):
         with self.assertRaises(claimer.TaskError):
             claimer.run_opencode({"number": 9, "body": "test"}, 1, "", 10, session_id="--continue")
+
+    def test_resume_prompt_does_not_replay_issue_body(self):
+        issue = {"number": 9, "title": "test", "body": "SENSITIVE_UNIQUE_LONG_ISSUE_BODY"}
+        with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, "", "")) as runner:
+            claimer.run_opencode(issue, 1, "", 20, session_id="ses_safe123")
+        command = runner.call_args.args[0]
+        self.assertIn("--session", command)
+        self.assertNotIn("SENSITIVE_UNIQUE_LONG_ISSUE_BODY", command[-1])
+        self.assertIn("继续当前已授权任务", command[-1])
+        self.assertNotIn("--auto", command)
