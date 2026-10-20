@@ -24,7 +24,7 @@ REPO = "SuaceYY/AI-Security-Lab-2.0"
 STATE = ROOT / "data" / "dual_ai" / "coordinator.json"
 ROADMAP = ROOT / "docs" / "dual-ai-roadmap.md"
 TASK_RE = re.compile(r"GLM_TASK_JSON:\s*(\{[^\n]*\})")
-MAX_TASKS = 1
+MAX_TASKS = 3
 MAX_ROUNDS = 3
 
 
@@ -110,7 +110,7 @@ def create_next_issue(*, write: bool, state: dict) -> None:
         raise RuntimeError("invalid GitHub issue list")
     for issue in issues:
         if marker in str(issue.get("body", "")):
-            state["created"] = [issue["number"]]
+            state.setdefault("created", []).append(issue["number"])
             state["phase"] = "waiting_for_worker"
             save_state(state)
             print(f"[GitHub] Existing Issue #{issue['number']} recovered.")
@@ -122,7 +122,7 @@ def create_next_issue(*, write: bool, state: dict) -> None:
     if not number_match:
         raise RuntimeError("Issue created but ID unavailable; inspect GitHub before retry")
     number = int(number_match.group(1))
-    state["created"] = [number]
+    state.setdefault("created", []).append(number)
     state["phase"] = "waiting_for_worker"
     save_state(state)
     # Only after durable checkpoint do we mark it ready for the existing worker.
@@ -135,7 +135,7 @@ def review_new_pr(*, write: bool, state: dict) -> None:
                    "--json", "number,isDraft,headRefOid,body"], root=ROOT)
     if not isinstance(prs, list):
         raise RuntimeError("invalid PR list")
-    issue_numbers = state.get("created", [])
+    issue_numbers = state.get("created", [])[-1:]
     for pr in prs:
         if pr.get("isDraft") or not isinstance(pr.get("headRefOid"), str):
             continue
