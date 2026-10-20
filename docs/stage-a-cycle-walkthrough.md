@@ -1,6 +1,6 @@
 # 一轮 Stage A 的端到端操作时序手册
 
-本手册描述 dual-AI 协调流程中完整一轮 Stage A 的时序、每一步应核对的最低限度事实，以及异常分支的处理方式。本手册自身可独立阅读；相关规则细节请参见 `docs/dual-ai-coordinator-guide.md`、`docs/issue-claimer-guide-zh.md`、`docs/operator-runbook.md`、`docs/untrusted-input-handling.md` 与 `docs/audit-visibility-fields.md`，本文不重述其内容。本文仅作说明，不含可直接执行的命令片段。
+本手册描述 dual-AI 协调流程中完整一轮 Stage A 的时序、每一步应核对的最低限度事实，以及异常分支的处理方式。本手册自身可独立阅读；相关规则细节请参见 `docs/dual-ai-coordinator-guide.md` 与 `docs/issue-claimer-guide-zh.md`，本文不重述其内容。本文仅作说明，不含可直接执行的命令片段。
 
 ## 1. 完整一轮 Stage A 的时序步骤
 
