@@ -59,6 +59,7 @@ class CoordinatorTests(unittest.TestCase):
                 "仅新增 docs/coordinator-parser-note.md。"
                 "验收标准：说明解析行为和人工审核闸门。"
                 "固定验证：仅该文件变更。"
+                "复核时检查字段完整、路径无越界，并确认没有重复创建 GitHub 任务。"
             ),
             "key": "coordinator-parser-note",
         }
