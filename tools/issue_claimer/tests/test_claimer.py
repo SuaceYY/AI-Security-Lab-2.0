@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -91,6 +93,35 @@ class IssueSelectionTests(TempDataTest):
                 self.assertFalse(eligible)
                 self.assertIn("already recorded", reason)
 
+    def test_select_next_issue_scans_ready_issues_after_first_run(self) -> None:
+        state = {
+            "tasks": {"2": {"status": "succeeded", "stage": "succeeded"}},
+            "first_run_completed": True,
+        }
+        issue_two = {
+            "number": 2,
+            "state": "OPEN",
+            "labels": [{"name": "ai-ready"}],
+        }
+        issue_three = {
+            "number": 3,
+            "state": "OPEN",
+            "labels": [{"name": "ai-ready"}],
+        }
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "fetch_issue", side_effect=AssertionError),
+            mock.patch.object(
+                m,
+                "list_ready_issues",
+                return_value=[issue_two, issue_three],
+            ),
+            mock.patch.object(m, "remote_claim_exists", return_value=(False, "")),
+        ):
+            issue = m.select_next_issue()
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["number"], 3)
+
     def test_fetch_issue_uses_gh_json(self) -> None:
         payload = json.dumps(
             {
@@ -171,6 +202,46 @@ class DryRunTests(TempDataTest):
         self.assertFalse(m.STATE_FILE.exists())
         self.assertFalse(m.STATUS_FILE.exists())
         self.assertFalse(m.HANDOFF_FILE.exists())
+
+    def test_dry_run_uses_worker_selection_after_first_run(self) -> None:
+        state = {"tasks": {}, "first_run_completed": True}
+        issue = {
+            "number": 3,
+            "title": "new issue",
+            "state": "OPEN",
+            "labels": [{"name": "ai-ready"}],
+            "url": "https://example.invalid/3",
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(m, "preflight", return_value={}),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "fetch_issue", side_effect=AssertionError),
+            mock.patch.object(m, "list_ready_issues", return_value=[issue]),
+            mock.patch.object(m, "remote_claim_exists", return_value=(False, "")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(m.dry_run(), 0)
+
+        self.assertIn("number: 3", output.getvalue())
+        self.assertIn("claimable: yes", output.getvalue())
+        self.assertFalse(m.STATE_FILE.exists())
+        self.assertFalse(m.STATUS_FILE.exists())
+
+    def test_dry_run_reports_reason_when_no_issue_is_eligible(self) -> None:
+        state = {"tasks": {}, "first_run_completed": True}
+        output = io.StringIO()
+        with (
+            mock.patch.object(m, "preflight", return_value={}),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "list_ready_issues", return_value=[]),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(m.dry_run(), 2)
+
+        self.assertIn("number: (none)", output.getvalue())
+        self.assertIn("no open issues", output.getvalue())
+        self.assertIn("claimable: no", output.getvalue())
 
 
 class CommandSafetyTests(TempDataTest):
@@ -607,6 +678,367 @@ class RepositoryStateTests(TempDataTest):
         self.assertIn("opencode run", task["recovery"])
         self.assertIn("completed_at", task)
         checkpoint.assert_called()
+
+
+class ManualRecoveryTests(TempDataTest):
+    def recovery_state(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "first_run_completed": True,
+            "tasks": {
+                "2": {
+                    "issue_number": 2,
+                    "title": "broken task",
+                    "status": "failed",
+                    "stage": "recovery_required",
+                    "failure_reason": "previous worker stopped",
+                    "tests": "not_run",
+                    "recovery": "opencode run --continue",
+                    "recovery_count": 1,
+                    "next_step": "inspect worktree",
+                }
+            },
+            "recovery_history": [],
+        }
+
+    def test_recovery_requires_confirmation_and_writes_nothing(self) -> None:
+        state = self.recovery_state()
+        output = io.StringIO()
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            redirect_stdout(output),
+        ):
+            result = m.manual_recover(2, "retry", confirm=False, note="approved")
+
+        self.assertEqual(result, 2)
+        self.assertIn("no changes written", output.getvalue())
+        save.assert_not_called()
+        self.assertEqual(
+            state["tasks"]["2"]["stage"],
+            "recovery_required",
+        )
+        self.assertEqual(state["recovery_history"], [])
+
+    def test_retry_is_explicit_audited_and_claimable(self) -> None:
+        state = self.recovery_state()
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            mock.patch.object(m, "write_checkpoint") as checkpoint,
+        ):
+            result = m.manual_recover(2, "retry", confirm=True, note="approved")
+
+        task = state["tasks"]["2"]
+        self.assertEqual(result, 0)
+        self.assertEqual(task["status"], m.RETRY_AUTHORIZED_STATUS)
+        self.assertEqual(task["stage"], m.MANUAL_RETRY_STAGE)
+        self.assertEqual(task["failure_reason"], "previous worker stopped")
+        self.assertEqual(task["manual_recovery"]["action"], "retry")
+        self.assertEqual(task["manual_recovery"]["note"], "approved")
+        self.assertEqual(task["recovery_history"][0]["action"], "retry")
+        self.assertEqual(len(state["recovery_history"]), 1)
+        archived = state["recovery_history"][0]
+        self.assertEqual(archived["previous_stage"], "recovery_required")
+        self.assertEqual(archived["task"]["stage"], "recovery_required")
+        save.assert_called_once()
+        checkpoint.assert_called_once()
+
+        issue = {"number": 2, "state": "OPEN", "labels": [{"name": "ai-ready"}]}
+        with mock.patch.object(m, "remote_claim_exists", return_value=(False, "")):
+            eligible, reason = m.evaluate_issue(state, issue)
+        self.assertTrue(eligible, reason)
+
+    def test_repeated_recovery_does_not_duplicate_or_consume_authorization(self) -> None:
+        state = self.recovery_state()
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            mock.patch.object(m, "write_checkpoint"),
+        ):
+            first = m.manual_recover(2, "retry", confirm=True)
+            second = m.manual_recover(2, "retry", confirm=True)
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 2)
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], m.RETRY_AUTHORIZED_STATUS)
+        self.assertEqual(task["stage"], m.MANUAL_RETRY_STAGE)
+        self.assertEqual(len(state["recovery_history"]), 1)
+        self.assertEqual(len(task["recovery_history"]), 1)
+        save.assert_called_once()
+
+    def test_close_keeps_failure_record_and_remains_unclaimable(self) -> None:
+        state = self.recovery_state()
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            mock.patch.object(m, "write_checkpoint"),
+        ):
+            result = m.manual_recover(2, "close", confirm=True)
+
+        task = state["tasks"]["2"]
+        self.assertEqual(result, 0)
+        self.assertEqual(task["status"], m.ABANDONED_STATUS)
+        self.assertEqual(task["stage"], m.MANUAL_CLOSED_STAGE)
+        self.assertEqual(task["failure_reason"], "previous worker stopped")
+        self.assertIn("not be re-claimed", task["next_step"])
+        self.assertEqual(state["recovery_history"][0]["action"], "close")
+        save.assert_called_once()
+
+        issue = {"number": 2, "state": "OPEN", "labels": [{"name": "ai-ready"}]}
+        eligible, reason = m.evaluate_issue(state, issue)
+        self.assertFalse(eligible)
+        self.assertIn("already recorded", reason)
+
+    def test_only_recovery_required_tasks_can_be_recovered(self) -> None:
+        state = self.recovery_state()
+        state["tasks"]["2"]["stage"] = "failed"
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+        ):
+            result = m.manual_recover(2, "retry", confirm=True)
+
+        self.assertEqual(result, 2)
+        save.assert_not_called()
+        self.assertEqual(state["recovery_history"], [])
+
+    def test_recovery_is_blocked_while_a_worker_holds_the_lock(self) -> None:
+        state = self.recovery_state()
+        with (
+            mock.patch.object(m, "configure_logging", return_value=mock.Mock()),
+            mock.patch.object(m, "InstanceLock") as lock_class,
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+        ):
+            lock_class.return_value.acquire.return_value = False
+            result = m.manual_recover(2, "retry", confirm=True)
+
+        self.assertEqual(result, 1)
+        save.assert_not_called()
+        self.assertEqual(state["tasks"]["2"]["stage"], "recovery_required")
+
+    def test_authorized_retry_is_archived_when_worker_claims_it(self) -> None:
+        state = {
+            "tasks": {
+                "2": {
+                    "issue_number": 2,
+                    "status": m.RETRY_AUTHORIZED_STATUS,
+                    "stage": m.MANUAL_RETRY_STAGE,
+                    "failure_reason": "old failure",
+                }
+            },
+            "first_run_completed": True,
+            "recovery_history": [],
+        }
+        issue = {"number": 2, "title": "test", "state": "OPEN", "labels": []}
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state"),
+            mock.patch.object(m, "write_checkpoint"),
+            mock.patch.object(m, "preflight_retry"),
+            mock.patch.object(m, "git", side_effect=RuntimeError("boom")),
+        ):
+            with self.assertRaises(m.StopWorker):
+                m.process_issue(issue)
+
+        self.assertEqual(len(state["recovery_history"]), 1)
+        archived = state["recovery_history"][0]
+        self.assertEqual(archived["action"], "retry_started")
+        self.assertEqual(archived["previous_stage"], m.MANUAL_RETRY_STAGE)
+        self.assertEqual(archived["previous_failure_reason"], "old failure")
+        self.assertEqual(archived["task"]["stage"], m.MANUAL_RETRY_STAGE)
+        self.assertEqual(state["tasks"]["2"]["status"], "failed")
+
+
+class RealGitRecoveryTests(TempDataTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo_temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.repo_temp.name).resolve()
+        self._run_git("init", "-b", "main")
+        self._run_git("config", "user.name", "Test")
+        self._run_git("config", "user.email", "test@example.invalid")
+        (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
+        self._run_git("add", "base.txt")
+        self._run_git("commit", "-m", "base")
+        self.project_patcher = mock.patch.object(m, "PROJECT_ROOT", self.repo)
+        self.project_patcher.start()
+
+    def tearDown(self) -> None:
+        self.project_patcher.stop()
+        self.repo_temp.cleanup()
+        super().tearDown()
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(self.repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def _run_git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        result = self._git(*args)
+        if result.returncode != 0:
+            raise AssertionError(
+                f"git {' '.join(args)} failed: {result.stderr or result.stdout}"
+            )
+        return result
+
+    def retry_state(self) -> dict[str, object]:
+        prior = {
+            "issue_number": 2,
+            "action": "retry",
+            "previous_failure_reason": "old failure",
+        }
+        return {
+            "version": 1,
+            "first_run_completed": True,
+            "tasks": {
+                "2": {
+                    "issue_number": 2,
+                    "title": "old task",
+                    "status": m.RETRY_AUTHORIZED_STATUS,
+                    "stage": m.MANUAL_RETRY_STAGE,
+                    "branch": "ai/issue-2",
+                    "failure_reason": "old failure",
+                    "tests": "not_run",
+                    "recovery": "opencode run --continue",
+                    "recovery_count": 1,
+                    "recovery_history": [copy.deepcopy(prior)],
+                    "next_step": "explicit retry authorized",
+                }
+            },
+            "recovery_history": [copy.deepcopy(prior)],
+        }
+
+    def issue(self) -> dict[str, object]:
+        return {
+            "number": 2,
+            "title": "test",
+            "state": "OPEN",
+            "labels": [{"name": "ai-ready"}],
+        }
+
+    def test_dirty_worktree_keeps_retry_authorization(self) -> None:
+        state = self.retry_state()
+        history = copy.deepcopy(state["recovery_history"])
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            mock.patch.object(m, "write_checkpoint") as checkpoint,
+            mock.patch.object(m, "remote_claim_exists") as remote,
+        ):
+            with self.assertRaises(m.StopWorker):
+                m.process_issue(self.issue())
+
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], m.RETRY_AUTHORIZED_STATUS)
+        self.assertEqual(task["stage"], m.MANUAL_RETRY_STAGE)
+        self.assertEqual(task["failure_reason"], "old failure")
+        self.assertEqual(state["recovery_history"], history)
+        self.assertIn("working tree", task["preflight_failure"])
+        self.assertIn("retry authorization retained", task["next_step"])
+        self.assertEqual(task["preflight_history"][-1]["result"], "failed")
+        remote.assert_not_called()
+        save.assert_called_once()
+        checkpoint.assert_called_once()
+
+    def test_existing_local_branch_keeps_retry_authorization(self) -> None:
+        state = self.retry_state()
+        history = copy.deepcopy(state["recovery_history"])
+        self._run_git("switch", "-c", "ai/issue-2")
+        self._run_git("switch", "main")
+
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state"),
+            mock.patch.object(m, "write_checkpoint"),
+            mock.patch.object(m, "remote_claim_exists") as remote,
+        ):
+            with self.assertRaises(m.StopWorker):
+                m.process_issue(self.issue())
+
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], m.RETRY_AUTHORIZED_STATUS)
+        self.assertEqual(state["recovery_history"], history)
+        self.assertIn("local task branch already exists", task["preflight_failure"])
+        self.assertIn("retry authorization retained", task["next_step"])
+        remote.assert_not_called()
+
+    def test_clean_authorized_retry_preflight_passes(self) -> None:
+        with mock.patch.object(m, "remote_claim_exists", return_value=(False, "")):
+            m.preflight_retry(2, "ai/issue-2")
+        self.assertFalse(m.local_branch_exists("ai/issue-2"))
+
+    def test_remote_branch_keeps_retry_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as bare_name:
+            bare = Path(bare_name)
+            self._run_git("init", "--bare", str(bare))
+            self._run_git("remote", "add", "origin", str(bare))
+            self._run_git("push", "origin", "main")
+            self._run_git("switch", "-c", "ai/issue-2")
+            self._run_git("push", "origin", "ai/issue-2")
+            self._run_git("switch", "main")
+            self._run_git("branch", "-D", "ai/issue-2")
+
+            with self.assertRaises(m.TaskError) as raised:
+                m.preflight_retry(2, "ai/issue-2")
+        self.assertIn("remote branch already exists", str(raised.exception))
+
+    def test_existing_pull_request_keeps_retry_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as bare_name:
+            bare = Path(bare_name)
+            self._run_git("init", "--bare", str(bare))
+            self._run_git("remote", "add", "origin", str(bare))
+            self._run_git("push", "origin", "main")
+            prs = json.dumps(
+                [{"number": 9, "url": "https://example.invalid/pr/9", "state": "OPEN"}]
+            )
+
+            with (
+                mock.patch.object(m, "gh", return_value=ok(prs)),
+                self.assertRaises(m.TaskError) as raised,
+            ):
+                m.preflight_retry(2, "ai/issue-2")
+        self.assertIn("pull request already exists", str(raised.exception))
+
+    def test_clean_retry_archives_prior_failure_before_new_attempt(self) -> None:
+        state = self.retry_state()
+        prior_history = copy.deepcopy(state["tasks"]["2"]["recovery_history"])
+
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state"),
+            mock.patch.object(m, "write_checkpoint"),
+            mock.patch.object(m, "remote_claim_exists", return_value=(False, "")),
+        ):
+            with self.assertRaises(m.StopWorker):
+                m.process_issue(self.issue())
+
+        archived = [
+            event
+            for event in state["recovery_history"]
+            if isinstance(event, dict) and event.get("action") == "retry_started"
+        ]
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]["previous_failure_reason"], "old failure")
+        self.assertEqual(archived[0]["task"]["status"], m.RETRY_AUTHORIZED_STATUS)
+        self.assertEqual(archived[0]["task"]["recovery_history"], prior_history)
+        self.assertEqual(state["tasks"]["2"]["status"], "failed")
 
 
 class CheckpointTests(TempDataTest):
