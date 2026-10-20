@@ -74,6 +74,15 @@ def message_role(message: dict) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def verify_response_model(message: dict, expected: str) -> None:
+    info = message.get("info")
+    if not isinstance(info, dict) or "/" not in expected:
+        raise TUITransportError("assistant response is missing model attribution")
+    provider_id, model_id = expected.split("/", 1)
+    if info.get("providerID") != provider_id or info.get("modelID") != model_id:
+        raise TUITransportError("assistant response model does not match the configured role")
+
+
 def run_prompt(
     role: str,
     prompt: str,
@@ -124,6 +133,7 @@ def run_prompt(
                 text = "\n".join(message_text(item) for item in after_user if message_text(item)).strip()
                 if not text:
                     raise TUITransportError("visible session finished without assistant text")
+                verify_response_model(after_user[-1], str(binding.get("model") or ""))
                 print(text, file=output, flush=True)
                 return text, session_id
         time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
