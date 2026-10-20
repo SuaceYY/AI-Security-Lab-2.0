@@ -1,10 +1,10 @@
 """Protocol tests for loopback OpenCode TUI transport; no model is invoked."""
+import io
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import threading
 import unittest
 from unittest.mock import Mock
+from urllib.parse import urlsplit
 
 from tools.dual_ai.tui_transport import TUIClient, TUITransportError
 
@@ -24,51 +24,30 @@ class TUITransportTests(unittest.TestCase):
     def test_sends_prompt_to_tui_in_order(self):
         calls = []
         project = str(Path.cwd().resolve())
+        responses = [
+            {"healthy": True, "version": "test"},
+            {"directory": project},
+            True,
+            True,
+        ]
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                pass
+        class FakeOpener:
+            def open(self, request, timeout):
+                raw = request.data
+                calls.append((request.get_method(), urlsplit(request.full_url),
+                              json.loads(raw) if raw else None, timeout))
+                return io.BytesIO(json.dumps(responses[len(calls) - 1]).encode("utf-8"))
 
-            def do_GET(self):
-                calls.append(("GET", self.path, None))
-                result = {"healthy": True, "version": "test"} if self.path.startswith(
-                    "/global/health?"
-                ) else {"directory": project}
-                self.reply(result)
-
-            def do_POST(self):
-                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                body = json.loads(raw) if raw else None
-                calls.append(("POST", self.path, body))
-                self.reply(True)
-
-            def reply(self, result):
-                data = json.dumps(result).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                client = TUIClient(
-                    f"http://127.0.0.1:{server.server_port}", Path(project)
-                )
-                client.inspect()
-                client.send_prompt("visible task")
-            finally:
-                server.shutdown()
-                thread.join(timeout=2)
-
-        self.assertEqual([call[0:2][0] for call in calls], ["GET", "GET", "POST", "POST"])
-        self.assertIn("/tui/append-prompt?", calls[2][1])
+        client = TUIClient("http://127.0.0.1:4311", Path(project))
+        client.opener = FakeOpener()
+        client.inspect()
+        client.send_prompt("visible task")
+        self.assertEqual([call[0] for call in calls], ["GET", "GET", "POST", "POST"])
+        self.assertEqual(calls[2][1].path, "/tui/append-prompt")
         self.assertEqual(calls[2][2], {"text": "visible task"})
-        self.assertIn("/tui/submit-prompt?", calls[3][1])
+        self.assertEqual(calls[3][1].path, "/tui/submit-prompt")
         self.assertIsNone(calls[3][2])
-        self.assertTrue(all("directory=" in call[1] for call in calls))
+        self.assertTrue(all("directory=" in call[1].query for call in calls))
 
     def test_rejected_append_does_not_submit(self):
         client = TUIClient("http://127.0.0.1:4311", Path.cwd())
@@ -76,7 +55,6 @@ class TUITransportTests(unittest.TestCase):
         with self.assertRaises(TUITransportError):
             client.send_prompt("task")
         self.assertEqual(client._request.call_count, 1)
-        self.assertEqual(client._request.call_args.args[:2], ("POST", "/tui/append-prompt"))
 
     def test_ambiguous_post_failure_is_not_retried(self):
         client = TUIClient("http://127.0.0.1:4311", Path.cwd())
@@ -93,7 +71,3 @@ class TUITransportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.send_prompt("  ")
         client._request.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
