@@ -1,0 +1,40 @@
+"""Regression tests for Issue Claimer input and session safeguards."""
+import importlib.util
+from pathlib import Path
+from unittest import TestCase, mock
+
+MODULE_PATH = Path(__file__).with_name("claimer.py")
+spec = importlib.util.spec_from_file_location("issue_claimer_under_test", MODULE_PATH)
+claimer = importlib.util.module_from_spec(spec)
+import sys
+sys.modules[spec.name] = claimer
+spec.loader.exec_module(claimer)
+
+
+class ClaimerRegressionTests(TestCase):
+    def test_rejects_empty_issue_body(self):
+        with self.assertRaises(claimer.TaskError):
+            claimer.build_prompt({"number": 9, "title": "test", "body": ""}, 1, "")
+
+    def test_prompt_includes_issue_body_and_chinese(self):
+        result = claimer.build_prompt({"number": 9, "title": "test", "body": "仅新增 docs/test.md"}, 1, "")
+        self.assertIn("仅新增 docs/test.md", result)
+        self.assertIn("Simplified Chinese", result)
+
+    def test_exact_session_matching(self):
+        output = (
+            "Session ID                         Title\n"
+            "ses_aaa111                          AI issue #9 attempt 1\n"
+            "ses_bbb222                          AI issue #6 attempt 1\n"
+        )
+        with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, output, "")):
+            self.assertEqual(claimer.find_opencode_session(9, 1), "ses_aaa111")
+
+    def test_ambiguous_session_fails_closed(self):
+        output = "ses_aaa111   AI issue #9 attempt 1\nses_bbb222   AI issue #9 attempt 1\n"
+        with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, output, "")):
+            self.assertIsNone(claimer.find_opencode_session(9, 1))
+
+    def test_invalid_session_rejected_before_execution(self):
+        with self.assertRaises(claimer.TaskError):
+            claimer.run_opencode({"number": 9, "body": "test"}, 1, "", 10, session_id="--continue")
