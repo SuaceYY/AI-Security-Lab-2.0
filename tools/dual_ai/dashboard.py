@@ -22,39 +22,62 @@ PORT = 8765
 
 PAGE = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>双 AI 协作控制台</title>
+<title>GLM × DeepSeek 协作会话</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif}
-body{margin:0;background:#10131b;color:#e9edf5}header{padding:24px 5%;background:#191f2d;border-bottom:1px solid #313b50}
-h1{margin:0 0 8px;font-size:25px}.muted{color:#9ba9bf}.wrap{max-width:1150px;margin:24px auto;padding:0 18px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
-.card{background:#1b2231;border:1px solid #343e50;border-radius:13px;padding:20px}
-h2{font-size:17px;margin:0 0 14px}.big{font-size:24px;font-weight:700;margin:12px 0}
-.pill{display:inline-block;padding:5px 12px;background:#30425c;border-radius:20px}
-#events{max-height:55vh;overflow:auto}.event{border-left:3px solid #608bdb;padding:8px 14px;margin:8px 0;background:#232c3d;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere}
-a{color:#83b5ff}button{background:#304b77;color:white;border:0;border-radius:8px;padding:9px 15px;cursor:pointer}
-</style><header><h1>双 AI 协作控制台</h1><div class="muted">GLM 规划 → DeepSeek 执行 → GLM 审查 → 人工合并 · 只读实时视图</div></header>
-<div class="wrap"><div class="grid">
-<div class="card"><h2>GLM 协调器</h2><div id="phase" class="big">读取中…</div><div id="created" class="muted"></div></div>
-<div class="card"><h2>DeepSeek Worker</h2><div id="worker" class="big">读取中…</div><div id="issue" class="muted"></div></div>
-<div class="card"><h2>人工审核</h2><div class="big">禁止自动合并</div><a href="https://github.com/SuaceYY/AI-Security-Lab-2.0/pulls" target="_blank" rel="noopener">查看 GitHub PR ↗</a></div>
-</div><section class="card" style="margin-top:18px"><h2>实时任务时间线 <span id="updated" class="muted"></span></h2>
-<div class="muted">显示系统实际记录的阶段事件，不伪造模型内部思考。每 3 秒刷新。</div>
-<div id="events"></div></section></div>
+*{box-sizing:border-box}body{margin:0;background:#10131b;color:#e9edf5}
+header{padding:19px 4%;border-bottom:1px solid #333d50;background:#191f2d}
+h1{font-size:22px;margin:0 0 7px}.muted{color:#a2afc2;font-size:13px}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:18px;max-width:1500px;margin:auto}
+.panel{background:#1b2231;border:1px solid #344054;border-radius:14px;min-width:0;overflow:hidden}
+.panel h2{padding:16px;margin:0;border-bottom:1px solid #354157;font-size:17px}
+.feed{height:65vh;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+.bubble{max-width:96%;background:#2b364c;border-radius:13px;padding:13px 16px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}
+.bubble.glm{border-left:4px solid #a18dff}.bubble.ds{border-left:4px solid #48c3a7}
+.meta{font-size:12px;color:#b6c5dd;margin-bottom:7px;font-weight:bold}
+.bottom{padding:15px 18px;border-top:1px solid #354157;color:#a2afc2;font-size:13px}
+a{color:#8dbaff}.full{grid-column:1/-1;padding:16px}
+@media(max-width:760px){.layout{grid-template-columns:1fr}.feed{height:45vh}}
+</style>
+<header><h1>GLM × DeepSeek · 协作会话</h1><div class="muted">真实任务与执行事件 · 左右分屏 · 3 秒自动刷新 · 只读 · 不展示未经采集的模型内部思考</div></header>
+<div class="layout">
+<section class="panel"><h2>🟣 GLM · 规划与审查</h2><div class="feed" id="glm"></div><div class="bottom" id="phase">加载中…</div></section>
+<section class="panel"><h2>🟢 DeepSeek · 执行与交付</h2><div class="feed" id="ds"></div><div class="bottom" id="worker">加载中…</div></section>
+<section class="panel full"><strong>人工合并闸门</strong> · <a href="https://github.com/SuaceYY/AI-Security-Lab-2.0/issues/15" target="_blank" rel="noopener">Issue #15 ↗</a> · <a href="https://github.com/SuaceYY/AI-Security-Lab-2.0/pull/16" target="_blank" rel="noopener">PR #16 ↗</a> <span class="muted">（界面不会合并 PR）</span></section>
+</div>
 <script>
+function bubble(who,header,text){
+ const el=document.createElement('article');el.className='bubble '+who;
+ const title=document.createElement('div');title.className='meta';title.textContent=header;
+ const body=document.createElement('div');body.textContent=text;el.append(title,body);return el;
+}
+let lastKey='';
 async function refresh(){
  try{
- const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);
- const d=await r.json();
- document.getElementById('phase').textContent=d.coordinator.phase||'idle';
- document.getElementById('created').textContent='协调器创建的 Issue：'+(d.coordinator.created||[]).map(n=>'#'+n).join('、');
- document.getElementById('worker').textContent=d.worker_stage||'等待事件';
- document.getElementById('issue').textContent=d.current_issue?'当前 Issue #'+d.current_issue:'尚无新任务事件';
- document.getElementById('events').replaceChildren(...d.events.map(e=>{
- const div=document.createElement('div');div.className='event';div.textContent=e;return div;
- }));
- document.getElementById('updated').textContent=' · 更新于 '+new Date().toLocaleTimeString();
- }catch(e){document.getElementById('updated').textContent=' · 读取失败：'+e.message}
+ const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)throw Error(response.status);
+ const d=await response.json(), glm=[],ds=[];
+ const issue=d.current_issue||15;
+ glm.push(bubble('glm','GLM · 任务交接','已创建 Issue #'+issue+'。任务详情与验收标准请查看 GitHub Issue。'));
+ const items=d.events.filter(e=>e.includes('#'+issue)||e.includes('verification'));
+ for(const line of items){
+  const low=line.toLowerCase();
+  if(low.includes('claimed issue'))ds.push(bubble('ds','DeepSeek · 领取任务','已领取 Issue #'+issue+'，准备执行。'));
+  else if(low.includes('starting opencode'))ds.push(bubble('ds','DeepSeek · 开始执行','OpenCode 开始执行任务。'));
+  else if(low.includes('session for issue'))ds.push(bubble('ds','DeepSeek · 会话已建立','已创建执行会话。'));
+  else if(low.includes('running fixed verification'))ds.push(bubble('ds','DeepSeek · 验证','正在执行固定验证。'));
+  else if(low.includes('succeeded with commit')){
+    ds.push(bubble('ds','DeepSeek · 已交付','任务完成并创建 PR。\n'+line.match(/https:\/\/\S+/)?.[0]));
+  }else if(low.includes('failed'))ds.push(bubble('ds','DeepSeek · 失败',line));
+ }
+ if(ds.length===0)ds.push(bubble('ds','DeepSeek · 等待','尚未采集到当前任务的执行事件。'));
+ const key=JSON.stringify({items,phase:d.coordinator.phase,worker:d.worker_stage});
+ if(key!==lastKey){for(const [id,arr] of [['glm',glm],['ds',ds]]){
+ const box=document.getElementById(id);const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-80;
+ box.replaceChildren(...arr);if(atBottom)box.scrollTop=box.scrollHeight;
+ }lastKey=key;}
+ document.getElementById('phase').textContent='GLM 状态：'+(d.coordinator.phase||'idle')+' · 审查内容将在接入审查记录后显示';
+ document.getElementById('worker').textContent='Worker：'+d.worker_stage+' · 当前展示可核实的执行阶段，并非模型逐字对话';
+ }catch(e){document.getElementById('worker').textContent='数据读取失败：'+e.message}
 }
 refresh();setInterval(refresh,3000);
 </script></html>"""
