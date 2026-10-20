@@ -81,11 +81,14 @@ def format_compatibility_checkpoint(previous):
 
 
 class WebBatch:
-    def __init__(self, batch_id, plan, *, resume_report_ref=None, resume_completed_review=False, resume_format_compatibility=False):
+    def __init__(self, batch_id, plan, *, resume_report_ref=None, resume_completed_review=False, resume_format_compatibility=False,
+                 resume_verified_development=False):
         self.batch_id = batch_id
         self.resume_report_ref = resume_report_ref
         self.resume_completed_review = resume_completed_review
         self.resume_format_compatibility = resume_format_compatibility
+        self.resume_verified_development = resume_verified_development
+        self.recovered_capture = None
         self.plan = plan
         self.path = state_path(batch_id)
         self.state = {"batch_id": batch_id, "plan_sha256": plan_digest(plan),
@@ -138,7 +141,8 @@ class WebBatch:
         save(self.path, self.state)
 
     def __enter__(self):
-        if self.path.exists() and self.resume_report_ref is None and not self.resume_completed_review:
+        if (self.path.exists() and self.resume_report_ref is None
+                and not self.resume_completed_review and not self.resume_verified_development):
             self.replay_refused = True
             raise HumanRequired("该 batch-id 已有记录；请先评估旧批次，禁止重启清零计数。")
         if not self.batch_lock.acquire():
@@ -147,6 +151,8 @@ class WebBatch:
             self.batch_lock.release()
             raise HumanRequired("旧 Worker 仍在运行，请先在其 PowerShell 中停止调度。")
         try:
+            if self.resume_verified_development:
+                return self.enter_resume_verified_development()
             if self.resume_completed_review:
                 return self.enter_resume_review()
             if self.resume_report_ref is not None:
@@ -201,6 +207,137 @@ class WebBatch:
             self.worker_lock.release()
             self.batch_lock.release()
             raise
+
+    def enter_resume_verified_development(self):
+        """Resume only after a verified, pushed development commit and snapshot-scope pause.
+
+        No completed model request is replayed: its exact bound TUI response must match
+        the saved response. GitHub must show a unique unmerged draft PR and no
+        development report or review for this round.
+        """
+        self.replay_refused = True
+        if not self.path.is_file():
+            raise HumanRequired("缺少原批次状态，禁止重建或重放开发。")
+        previous = json.loads(self.path.read_text(encoding="utf-8"))
+        number = previous.get("round")
+        if (previous.get("batch_id") != self.batch_id
+                or previous.get("plan_sha256") != plan_digest(self.plan)
+                or previous.get("phase") != "needs_human"
+                or previous.get("action") != "development"
+                or previous.get("question") != "文件超出本批网页开发范围：backend/main.py"
+                or number != 1 or previous.get("rounds_completed") != 0
+                or previous.get("verified_development_recovery_attempts", 0) != 0
+                or previous.get("last_phase") is not None
+                or previous.get("last_report_id") is not None
+                or previous.get("branch") != self.branch
+                or type(previous.get("issue")) is not int):
+            raise HumanRequired("暂停点不是获准的首轮已提交开发恢复点。")
+        head, base = previous.get("head_sha"), previous.get("base_sha")
+        if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                or not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)
+                or head == base):
+            raise HumanRequired("原始代码提交或基线不符合受限恢复条件。")
+        ensure_clean_worktree()
+        self.original_branch = command(["branch", "--show-current"])
+        if (not self.original_branch or self.original_branch == "main"
+                or self.original_branch not in {previous.get("original_branch"), self.branch}):
+            raise HumanRequired("恢复入口必须在原工具分支或原批次分支运行。")
+        self.origin = read_origin_url()
+        if not origin_matches_repo(self.origin):
+            raise HumanRequired("Git origin 不属于授权仓库。")
+        self.head, self.base_sha, self.issue = head, base, previous["issue"]
+        if command(["rev-parse", self.branch]) != head:
+            raise HumanRequired("本地批次提交已变化，禁止重放。")
+        command(["fetch", "origin", self.branch])
+        if command(["rev-parse", "FETCH_HEAD"]) != head:
+            raise HumanRequired("远端批次提交已变化。")
+        command(["fetch", "origin", "main"])
+        if command(["rev-parse", "origin/main"]) != base:
+            raise HumanRequired("main 基线已变化，请人工评估冲突。")
+        prs = self.api("pulls?state=open&head=SuaceYY:" + self.branch)
+        matches = [item for item in prs if isinstance(item, dict)
+                   and item.get("head", {}).get("sha") == head
+                   and item.get("base", {}).get("ref") == "main"
+                   and item.get("draft") is True]
+        if len(prs) != 1 or len(matches) != 1:
+            raise HumanRequired("无法唯一核对未合并草稿 PR。")
+        self.pr = matches[0]["number"]
+        comments = self.api("issues/" + str(self.issue) + "/comments?per_page=100")
+        if not isinstance(comments, list) or len(comments) >= 100:
+            raise HumanRequired("无法完整核对 GitHub 交接记录。")
+        prefix = "<!-- web-batch=" + self.batch_id + " round=1 phase="
+        if (sum(prefix + "development_started -->" in str(x.get("body", ""))
+                for x in comments if isinstance(x, dict)) != 1
+                or any(prefix + p + " -->" in str(x.get("body", ""))
+                       for x in comments if isinstance(x, dict)
+                       for p in ("development", "review_started", "review",
+                                 "repair_started", "repair", "round_complete",
+                                 "resume_verified_development"))):
+            raise HumanRequired("开发报告或评审可能已经投递，禁止再次发送。")
+        response_file = DATA / self.batch_id / "response-1-development.json"
+        if not response_file.is_file():
+            raise HumanRequired("原 DeepSeek 回复文件不存在。")
+        recorded = json.loads(response_file.read_text(encoding="utf-8"))
+        saved_text = recorded.get("text")
+        if (recorded.get("role") != "executor" or recorded.get("round") != 1
+                or recorded.get("phase") != "development"
+                or not isinstance(saved_text, str) or not saved_text):
+            raise HumanRequired("原始 DeepSeek 回复记录不完整。")
+        parsed = parse_result(saved_text)
+        if parsed["status"] != "done":
+            raise HumanRequired("原始 DeepSeek 开发没有明确完成。")
+        self.sessions = VisibleWebSessions(ROOT, self.context_checkpoint)
+        self.sessions.check()
+        if self.sessions.session_ids != previous.get("sessions"):
+            raise HumanRequired("可见模型会话发生变化，禁止替换已完成的模型调用。")
+        events = [event for event in previous.get("context_events", [])
+                  if event.get("round") == 1 and event.get("phase") == "model_usage"
+                  and event.get("data", {}).get("role") == "executor"
+                  and event.get("data", {}).get("purpose", "task") == "task"]
+        if len(events) != 1:
+            raise HumanRequired("无法唯一确认原开发模型消息。")
+        mid = events[0]["data"].get("message_id")
+        if not isinstance(mid, str) or not re.fullmatch(r"msg_[A-Za-z0-9_-]+", mid):
+            raise HumanRequired("原开发消息标识无效。")
+        client, binding = self.sessions.client("executor")
+        sid = binding["session_id"]
+        original = client._request("GET", "/session/" + sid + "/message/" + mid)
+        info = original.get("info", {}) if isinstance(original, dict) else {}
+        if (not isinstance(original, dict) or message_role(original) != "assistant"
+                or info.get("id") != mid or info.get("sessionID") != sid
+                or info.get("error")
+                or (isinstance(info.get("cost"), (int, float)) and info["cost"] > 0)):
+            raise HumanRequired("原开发消息无法验证或出现异常费用。")
+        verify_response_model(original, binding["model"])
+        if response_text(original) != saved_text:
+            raise HumanRequired("OpenCode 原回复与本地保存的原文不一致。")
+        if self.original_branch != self.branch:
+            command(["switch", self.branch])
+        self.config = read_local_git_config()
+        self.guard()
+        self.backend_environment = backend_python(ROOT)
+        before = self.fingerprint()
+        verification = self.verify()
+        if not verification["ok"] or self.fingerprint() != before:
+            raise HumanRequired("恢复前固定测试未通过或修改了工作区。")
+        source = self.snapshot(True)
+        source_hash = hashlib.sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        self.state = previous
+        report = {"batch_id": self.batch_id, "round": 1, "phase": "development",
+                  "time": now(), "head_sha": head, "pr": self.pr,
+                  "model_result": parsed, "model_report": saved_text,
+                  "verification": verification,
+                  "format_recovery": previous.get("format_recoveries", {}).get("1-development"),
+                  "source": source, "source_hash": source_hash}
+        self.local_checkpoint("resuming_verified_development", {
+            "pr": self.pr, "verified_development_recovery_attempts": 1,
+            "last_verification": verification, "question": "",
+            "resume_source": "original_saved_and_bound_tui_development"})
+        self.recovered_capture = report
+        self.replay_refused = False
+        print("恢复原 Issue #" + str(self.issue) +
+              "：复用第1轮已提交开发及原 DeepSeek 回复，从 GitHub 开发报告继续，未重跑开发。", flush=True)
+        return self
 
     def enter_resume(self):
         """Resume only a durable development report before any GLM dispatch."""
@@ -551,8 +688,6 @@ class WebBatch:
         )
 
     def develop(self, number, focus, last):
-        if number == 3:
-            focus = "只做一个小目标：现有页面把过滤后的代码提交到/api/scans并展示基础Finding列表，保留过滤和最小加载/错误反馈。JSON导出、复杂任务看板和额外规则留为后续建议，尽量限定2到3个前端源码/测试文件。"
         self.begin_call(number, "development")
         text = self.sessions.call("executor", self.prompt(number, "development", {
             "本轮开发子步骤": focus, "上一轮已发布结果": last,
@@ -605,10 +740,12 @@ class WebBatch:
                 "backend_environment": self.backend_environment}
 
     def snapshot(self, verified):
-        paths = sorted(set(command(["diff", "--name-only", self.base_sha, "HEAD", "--"]).splitlines()
-                           + collect_changed_paths()
-                           + ["frontend/src/App.tsx", "frontend/src/fileFilter.ts", "backend/main.py"]))
-        check_scope(paths, self.plan)
+        changed = sorted(set(command(["diff", "--name-only", self.base_sha, "HEAD", "--"]).splitlines()
+                             + collect_changed_paths()))
+        # Only changed files are constrained by the approved edit scope.
+        # These three unmodified reference files are read-only review context.
+        check_scope(changed, self.plan)
+        paths = sorted(set(changed + ["frontend/src/App.tsx", "frontend/src/fileFilter.ts", "backend/main.py"]))
         sources = {}
         for path in paths:
             local = ROOT / path
