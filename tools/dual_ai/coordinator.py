@@ -66,10 +66,27 @@ def task_from_output(output: str) -> dict:
         raise ValueError("invalid title")
     if not isinstance(task["body"], str) or not 80 <= len(task["body"]) <= 9000:
         raise ValueError("invalid body")
-    if "docs/" not in task["body"]:
-        raise ValueError("first-stage tasks must be docs-scoped")
-    if re.search(r"(?i)(?:tools/issue_claimer|\\.github/|auto.merge|自动合并)", task["body"]):
-        raise ValueError("protected path or merge action in task")
+        body = task["body"]
+
+    # Extract the explicitly declared allowed modification path.
+    match = re.search(
+        r"允许修改路径[：:]\s*(?:仅\s*)?`?(docs/[a-zA-Z0-9_./-]+)",
+        body,
+    )
+    if not match:
+        raise ValueError("missing explicit allowed docs path")
+
+    allowed_path = match.group(1).rstrip("`.,，。；;")
+    if (
+        ".." in allowed_path.split("/")
+        or not allowed_path.endswith(".md")
+        or allowed_path.startswith("docs//")
+    ):
+        raise ValueError("invalid allowed docs path")
+
+    # Block instructions that explicitly request automatic merging.
+    if re.search(r"(?i)(?:请|执行|进行|启用|要求)\s*(?:自动合并|auto.merge)", body):
+        raise ValueError("automatic merge requested")
     if not isinstance(task["key"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", task["key"]):
         raise ValueError("invalid key")
     return task
