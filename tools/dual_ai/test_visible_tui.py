@@ -56,9 +56,8 @@ class VisibleTUITests(unittest.TestCase):
             with self.assertRaises(TUITransportError):
                 visible_tui.run_prompt("planner", "task", root=root, binding_file=binding,
                                        client_factory=Mock(return_value=client))
-            client.send_prompt.assert_not_called()
+            client.send_session_message.assert_not_called()
 
 
 if __name__ == "__main__":
     unittest.main()
-
