@@ -216,6 +216,26 @@ class CoordinatorTests(unittest.TestCase):
         review.assert_not_called()
 
 
+    def test_review_verification_plan_runs_dual_ai_unit_tests(self):
+        steps, error = coordinator.review_verification_plan([
+            "tools/dual_ai/coordinator.py",
+            "tools/dual_ai/test_coordinator.py",
+        ])
+        self.assertEqual(error, "")
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0].label, "dual_ai_unittests")
+        self.assertEqual(
+            steps[0].command[1:],
+            ("-m", "unittest", "discover", "-s", "tools/dual_ai", "-p", "test_*.py", "-v"),
+        )
+
+    @patch.object(coordinator, "build_verification_plan", return_value=([], "unsupported path"))
+    def test_review_verification_plan_fails_closed_for_unknown_scope(self, build_plan):
+        steps, error = coordinator.review_verification_plan(["tools/other/module.py"])
+        self.assertEqual(steps, [])
+        self.assertEqual(error, "unsupported path")
+        build_plan.assert_called_once_with(["tools/other/module.py"])
+
     def test_parse_glm_review_feedback_comment(self):
         comment = (
             "<!-- dual-ai-glm-review sha=abc123 -->\n"
