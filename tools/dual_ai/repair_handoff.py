@@ -64,7 +64,7 @@ def dispatch(pr_number: int, *, write: bool = False) -> None:
         return
     message = (
         marker + "\n### DeepSeek repair handoff\n\n"
-        f"GLM requested changes to PR #{pr_number} at \`{repair['sha']}\`.\n"
+        f"GLM requested changes to PR #{pr_number} at `{repair['sha']}`.\n"
         "Review the existing GLM feedback on the PR. Do not alter protected paths.\n"
         "Keep the same Issue/PR; run the worker's fixed validation and attach evidence.\n"
         "No automatic merge. Human approval required.\n"
