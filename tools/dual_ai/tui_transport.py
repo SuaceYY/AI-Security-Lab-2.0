@@ -141,8 +141,12 @@ class TUIClient:
     def get_session_status(self, session_id: str) -> str:
         session_id = self._validate_session_id(session_id)
         result = self._request("GET", "/session/status")
-        if not isinstance(result, dict) or session_id not in result:
-            raise TUITransportError("OpenCode did not return status for the bound session")
+        if not isinstance(result, dict):
+            raise TUITransportError("OpenCode returned an invalid session status map")
+        # OpenCode's status map contains active statuses. Idle sessions are
+        # omitted, so a missing key is the normal idle state.
+        if session_id not in result:
+            return "idle"
         status = result[session_id]
         if isinstance(status, str):
             kind = status
