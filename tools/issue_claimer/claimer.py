@@ -1367,7 +1367,7 @@ def build_verification_plan(
                     content = document.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
                     return [], f"cannot read documentation {path}: {exc}"
-                if not content.strip() or "\\x00" in content:
+                if not content.strip() or chr(0) in content:
                     return [], f"documentation is empty or invalid: {path}"
 
     if "frontend" in categories:
