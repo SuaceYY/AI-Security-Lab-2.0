@@ -134,6 +134,10 @@ def launch(ports: tuple[int, int], lifetime: int):
     owned = []
     nonce = uuid.uuid4().hex[:12]
     state_path = ROOT / "data" / "dual_ai" / f"visible-probe-{nonce}.json"
+    active_path = ROOT / "data" / "dual_ai" / "active_visible_sessions.json"
+    if active_path.exists():
+        raise RuntimeError(f"active visible TUI binding already exists: {active_path}")
+    active_written = False
     state = {"probe_id": nonce, "model_inference_requested": False,
              "visual_verification": "pending", "workflow_verified": False, "roles": {}}
     try:
@@ -167,7 +171,21 @@ def launch(ports: tuple[int, int], lifetime: int):
                 state["roles"][role]["session_id"], role, models[role], nonce))
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        active = {
+            "schema_version": 1,
+            "probe_id": nonce,
+            "root": str(ROOT),
+            "roles": {
+                role: {key: state["roles"][role][key] for key in ("url", "session_id", "model")}
+                for role in ROLES
+            },
+        }
+        active_tmp = active_path.with_suffix(".tmp")
+        active_tmp.write_text(json.dumps(active, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(active_tmp, active_path)
+        active_written = True
         print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
+        print(f"Visible TUI bindings written to {active_path}", flush=True)
         print("接口回读通过。请核对两个原生 TUI 中各自的连接标记。尚未验证模型执行或自动交接。", flush=True)
         print(f"保持窗口最多 {lifetime} 秒；Ctrl+C 关闭本次启动的进程。记录：{state_path}", flush=True)
         deadline = time.monotonic() + lifetime
@@ -183,6 +201,13 @@ def launch(ports: tuple[int, int], lifetime: int):
             except (OSError, subprocess.SubprocessError):
                 cleanup_failed = True
                 print(f"无法关闭本次进程 PID {process.pid}；请关闭对应验证窗口。")
+        if active_written:
+            try:
+                current = json.loads(active_path.read_text(encoding="utf-8"))
+                if current.get("probe_id") == nonce:
+                    active_path.unlink()
+            except (OSError, json.JSONDecodeError):
+                print(f"Could not clean up visible TUI binding file: {active_path}")
         if cleanup_failed:
             raise RuntimeError("probe process cleanup incomplete")
 
@@ -191,10 +216,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch", action="store_true", help="Open two NEW native TUI probe windows; zero model calls")
     parser.add_argument("--ports", type=int, nargs=2, default=(41961, 41962))
-    parser.add_argument("--lifetime", type=int, default=600)
+    parser.add_argument("--lifetime", type=int, default=28800)
     args = parser.parse_args()
-    if not 30 <= args.lifetime <= 1800:
-        parser.error("lifetime must be 30..1800 seconds")
+    if not 30 <= args.lifetime <= 28800:
+        parser.error("lifetime must be 30..28800 seconds")
     try:
         if args.launch:
             launch(tuple(args.ports), args.lifetime)

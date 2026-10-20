@@ -29,6 +29,9 @@ from typing import Any
 
 REPO = os.environ.get("ISSUE_CLAIMER_REPO", "SuaceYY/AI-Security-Lab-2.0")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+from tools.dual_ai.visible_tui import VisiblePromptTimeout, load_binding, run_prompt
+from tools.dual_ai.tui_transport import TUITransportError
 DATA_DIR = Path(
     os.environ.get("ISSUE_CLAIMER_DATA_DIR", str(PROJECT_ROOT / "data" / "issue_claimer"))
 ).resolve()
@@ -42,6 +45,7 @@ LOG_FILE = DATA_DIR / "claimer.log"
 
 LABEL = "ai-ready"
 FIRST_ISSUE = 2
+HISTORIC_ISSUES = {2, 6, 9, 10, 15}
 BASE_BRANCH = os.environ.get("ISSUE_CLAIMER_BASE_BRANCH", "main")
 POLL_SECONDS = int(os.environ.get("ISSUE_CLAIMER_POLL_SECONDS", "300"))
 MAX_ATTEMPTS = 2
@@ -532,8 +536,12 @@ def write_checkpoint(
 
 
 def finalize_first_run(state: dict[str, Any]) -> None:
-    task = state["tasks"].get(str(FIRST_ISSUE))
-    if task and task.get("status") in TERMINAL_STATUSES:
+    if state.get("first_run_completed"):
+        return
+    if any(
+        int(number) not in HISTORIC_ISSUES and task.get("status") in TERMINAL_STATUSES
+        for number, task in state.get("tasks", {}).items()
+    ):
         state["first_run_completed"] = True
 
 
@@ -701,6 +709,8 @@ def remote_claim_exists(number: int) -> tuple[bool, str]:
 
 def evaluate_issue(state: dict[str, Any], issue: dict[str, Any]) -> tuple[bool, str]:
     number = issue_number(issue)
+    if number in HISTORIC_ISSUES:
+        return False, f"issue #{number} is a permanently excluded historical task"
     existing = state["tasks"].get(str(number))
     if existing is not None:
         authorized = (
@@ -717,7 +727,11 @@ def evaluate_issue(state: dict[str, Any], issue: dict[str, Any]) -> tuple[bool, 
     if LABEL not in labels:
         return False, f"issue #{number} does not have the '{LABEL}' label"
 
-    if not state.get("first_run_completed", False) and number != FIRST_ISSUE:
+    if (
+        not state.get("first_run_completed", False)
+        and FIRST_ISSUE not in HISTORIC_ISSUES
+        and number != FIRST_ISSUE
+    ):
         return False, f"first run is restricted to issue #{FIRST_ISSUE}"
 
     exists, detail = remote_claim_exists(number)
@@ -732,7 +746,7 @@ def find_next_issue(
 ) -> tuple[dict[str, Any] | None, str]:
     logger = logging.getLogger("issue_claimer")
 
-    if not state.get("first_run_completed", False):
+    if not state.get("first_run_completed", False) and FIRST_ISSUE not in HISTORIC_ISSUES:
         try:
             issue = fetch_issue(FIRST_ISSUE)
         except TaskError as exc:
@@ -1131,45 +1145,33 @@ def run_opencode(
     session_id: str | None = None,
 ) -> CommandResult:
     number = issue_number(issue)
-    command = [
-        "opencode",
-        "run",
-        "--pure",
-        "--dir",
-        str(PROJECT_ROOT),
-        "--title",
-        f"AI issue #{number} attempt {attempt}",
-    ]
-    if session_id:
-        if not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
-            raise TaskError("invalid OpenCode session ID")
-        command.extend(["--session", session_id])
-    model = os.environ.get("ISSUE_CLAIMER_OPENCODE_MODEL", "").strip()
-    if model:
-        command.extend(["--model", model])
-    agent = os.environ.get("ISSUE_CLAIMER_OPENCODE_AGENT", "").strip()
-    if agent:
-        command.extend(["--agent", agent])
-    if session_id:
-        # Resume only the known session; resending the full Issue wastes context.
-        command.append(
-            "继续当前已授权任务。先简要整理本会话已有进度及剩余步骤，"
-            "只完成尚未完成的最小修改。遵守原有文件范围与安全限制，"
-            "不要执行 git add/commit/push、不要创建或合并 PR。"
-            "若无法安全继续，请明确说明并停止。使用简体中文回复。"
-        )
-    else:
-        command.append(build_prompt(issue, attempt, previous_error))
+    try:
+        binding = load_binding("executor")
+        bound_session = binding["session_id"]
+        if session_id and session_id != bound_session:
+            raise StopWorker("requested resume session does not match the visible DeepSeek session")
+        if session_id:
+            prompt = (
+                "继续当前已授权任务。先简要整理本会话已有进度及剩余步骤，"
+                "只完成尚未完成的最小修改。遵守原有文件范围与安全限制，"
+                "不要执行 git add/commit/push、不要创建或合并 PR。"
+                "若无法安全继续，请明确说明并停止。使用简体中文回复。"
+            )
+        else:
+            prompt = build_prompt(issue, attempt, previous_error)
 
-    logging.getLogger("issue_claimer").info(
-        "starting OpenCode attempt %s/%s for issue #%s", attempt, MAX_ATTEMPTS, number
-    )
-    return run_command(
-        command,
-        cwd=PROJECT_ROOT,
-        timeout=timeout,
-        env=sanitized_opencode_env(),
-    )
+        logging.getLogger("issue_claimer").info(
+            "submitting issue #%s attempt %s/%s to visible DeepSeek TUI session %s",
+            number, attempt, MAX_ATTEMPTS, bound_session,
+        )
+        text, observed_session = run_prompt("executor", prompt, timeout=timeout)
+        if observed_session != bound_session:
+            raise StopWorker("visible DeepSeek response came from an unexpected session")
+        return CommandResult(0, text, "")
+    except VisiblePromptTimeout as exc:
+        raise TaskTimeout(str(exc)) from exc
+    except (TUITransportError, ValueError) as exc:
+        raise StopWorker(f"visible DeepSeek TUI stopped safely: {exc}") from exc
 
 
 def context_exhausted(result: CommandResult) -> bool:
@@ -1575,7 +1577,7 @@ def process_issue(issue: dict[str, Any]) -> None:
 
             session_started_after_ms = int(time.time() * 1000) - 5000
             result = run_opencode(issue, attempt, previous_error, remaining)
-            session_id = find_opencode_session(number, attempt, session_started_after_ms)
+            session_id = load_binding("executor")["session_id"]
             if session_id:
                 task["opencode_session_id"] = session_id
                 save_state(state)
