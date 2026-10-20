@@ -186,8 +186,25 @@ def tick(*, write: bool) -> None:
     state = load_state()
     if not state.get("created"):
         create_next_issue(write=write, state=state)
-    else:
-        review_new_pr(write=write, state=state)
+        return
+    latest_issue = state["created"][-1]
+    # A human-merged PR explicitly linked to the last Issue is the only
+    # automatic next-task gate. Never treat a green CI as a merge.
+    merged = gh_json(["pr", "list", "--state", "merged", "--limit", "100",
+                      "--json", "number,body,mergedAt"], root=ROOT)
+    if not isinstance(merged, list):
+        raise RuntimeError("invalid merged PR list")
+    linked = [pr for pr in merged if re.search(
+        rf"(?i)(?:closes|fixes|resolves)\\s+#{latest_issue}\\b",
+        str(pr.get("body") or ""))]
+    if linked:
+        if len(state["created"]) >= MAX_TASKS:
+            print("[Coordinator] Human merge observed; task budget reached. Stop.")
+            return
+        print(f"[Coordinator] Issue #{latest_issue} merged; next planning gate.")
+        create_next_issue(write=write, state=state)
+        return
+    review_new_pr(write=write, state=state)
 
 
 def main() -> int:
