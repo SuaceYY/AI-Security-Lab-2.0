@@ -15,6 +15,10 @@ ROLES = {"planner", "executor"}
 SESSION_RE = re.compile(r"ses_[A-Za-z0-9_-]+\Z")
 
 
+class VisiblePromptTimeout(TUITransportError):
+    """The visible session did not finish within its bounded wait."""
+
+
 def load_bindings(path: Path = SESSION_FILE) -> dict[str, dict]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -124,7 +128,7 @@ def run_prompt(
                 return text, session_id
         time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
 
-    raise TUITransportError(
+    raise VisiblePromptTimeout(
         f"timed out waiting for visible {role} session {session_id}; prompt was not resent"
     )
 
