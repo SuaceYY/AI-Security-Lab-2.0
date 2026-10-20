@@ -61,6 +61,17 @@ def format_comment(pr_number: int, sha: str, verdict: dict) -> str:
     )
 
 
+def existing_review(pr_number: int, sha: str) -> bool:
+    """Use GitHub comments, not local cursor, to detect previously posted reviews."""
+    from tools.dual_ai.github_evidence import gh_json
+    comments = gh_json(["api", f"repos/SuaceYY/AI-Security-Lab-2.0/issues/{pr_number}/comments",
+                        "--paginate"], root=ROOT)
+    if not isinstance(comments, list):
+        raise ValueError("invalid GitHub comment list")
+    marker = f"<!-- dual-ai-glm-review sha={sha} -->"
+    return any(isinstance(c, dict) and marker in str(c.get("body", "")) for c in comments)
+
+
 def review(pr_number: int, *, post: bool = False) -> int:
     import sys
     evidence = fetch_pr_evidence(pr_number)
@@ -72,6 +83,9 @@ def review(pr_number: int, *, post: bool = False) -> int:
     if not isinstance(sha, str) or not sha:
         print("Missing head SHA.", file=sys.stderr)
         return 1
+    if post and existing_review(pr_number, sha):
+        print("[GitHub] GLM review already posted for this head SHA; skip.", flush=True)
+        return 0
     prompt = reviewer_prompt(evidence) + (
         "\n\n最后独立输出且只输出一行结构化裁决（其余分析正常输出）：\n"
         'GLM_REVIEW_VERDICT: {"status":"needs_evidence","reason":"至少十字的中文理由"}\n'
@@ -99,6 +113,9 @@ def review(pr_number: int, *, post: bool = False) -> int:
     if current.get("headRefOid") != sha or current.get("state") != "OPEN":
         print("PR changed during review; feedback cancelled.", file=sys.stderr)
         return 1
+    if existing_review(pr_number, sha):
+        print("[GitHub] GLM review already posted for this head SHA; skip.", flush=True)
+        return 0
     body = format_comment(pr_number, sha, verdict)
     proc = subprocess.run(
         ["gh", "pr", "comment", str(pr_number), "--body", body],
