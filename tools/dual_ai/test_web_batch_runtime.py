@@ -13,6 +13,9 @@ from tools.dual_ai.web_batch_runtime import WebBatch, FENCE, format_compatibilit
 from tools.issue_claimer import claimer as worker
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
+# Legacy offline tests intentionally exercise Python code edits. The active batch
+# plan can be narrower; never relax its production scope to satisfy a test.
+PLAN["allowed_suffixes"] = [".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".json"]
 RUNTIME = "tools.dual_ai.web_batch_runtime."
 
 
