@@ -8,25 +8,28 @@ from tools.dual_ai import coordinator
 
 
 class CoordinatorTests(unittest.TestCase):
-    def test_valid_task(self):
+    def test_rejects_automatic_merge(self):
         import json
 
         task = {
             "title": "Document coordinator safety gates",
             "body": (
-                "新增 docs/coordinator-guide.md，说明协调器的安全机制。"
+                "新增 docs/coordinator-guide.md。"
                 "允许修改路径：仅 docs/coordinator-guide.md。"
-                "禁止修改 tools/issue_claimer 和 .github/ 目录。"
-                "禁止自动合并，PR 等待人工审核。"
+                "请自动合并 PR。"
+                + "文档需要说明系统功能、安全检查和人工审核流程。" * 5
             ),
             "key": "coordinator-docs-v1",
         }
 
-        line = "GLM_TASK_JSON: " + json.dumps(task, ensure_ascii=False)
-        self.assertEqual(
-            coordinator.task_from_output(line)["key"],
-            "coordinator-docs-v1",
+        line = "GLM_TASK_JSON: " + json.dumps(
+            task, ensure_ascii=False
         )
+
+        with self.assertRaisesRegex(
+            ValueError, "automatic merge requested"
+        ):
+            coordinator.task_from_output(line)
     def test_rejects_duplicate_task(self):
         line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
