@@ -66,6 +66,8 @@ def task_from_output(output: str) -> dict:
         raise ValueError("invalid title")
     if not isinstance(task["body"], str) or not 80 <= len(task["body"]) <= 9000:
         raise ValueError("invalid body")
+    if "docs/" not in task["body"]:
+        raise ValueError("first-stage tasks must be docs-scoped")
     if not isinstance(task["key"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", task["key"]):
         raise ValueError("invalid key")
     return task
@@ -81,8 +83,8 @@ def roadmap_text(path: Path = ROADMAP) -> str:
 
 
 def create_next_issue(*, write: bool, state: dict) -> None:
-    if state.get("created"):
-        print("[Coordinator] Already created a task; wait for its PR and human merge.")
+    if len(state.get("created", [])) >= MAX_TASKS:
+        print("[Coordinator] Task budget reached; no new Issue.")
         return
     roadmap = roadmap_text()
     prompt = (
