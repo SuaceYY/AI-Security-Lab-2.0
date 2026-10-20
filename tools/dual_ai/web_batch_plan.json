@@ -1,26 +1,21 @@
 {
   "schema_version": 1,
-  "revision": 1,
-  "title": "网页阶段一：静态扫描、任务状态与 JSON Findings",
-  "roadmap": "沿用原网页开发顺序：基础结构 → FastAPI → React → 前后端通信 → 本地代码接入 → 文件过滤 → 静态扫描 → 任务状态与 JSON Findings。之后按原产品五阶段推进本地 AI、独立证据与误报控制、报告交付、扩展稳定性成本。现有文件过滤已实现；不重复 #2/#6/#9/#10/#15，也不继续 bootstrap 文档任务。",
-  "goal": "在已有网页与过滤器上完成可验证的最小静态代码审查闭环。只分析用户主动选择并过滤后的代码文本，不执行被审查代码，不扫描外部目标。保留 auto_lab.py、evidence_check.py、report_generator.py。三轮在同一开发分支累计，最终人工复核合并。",
+  "revision": 2,
+  "title": "网页阶段一加固：扫描响应深层校验与错误反馈",
+  "roadmap": "延续已合并PR #34的网页阶段一最小静态扫描闭环。当前只修复已复现的前端API响应校验缺口；之后独立安排请求体预限流、Finding数量/体积上限和浏览器E2E，不在本批混做。产品后续依既定大纲进入本地AI、证据独立核验、报告交付和稳定性成本优化。",
+  "goal": "为已有POST /api/scans与React结果页加固HTTP 200响应结构校验，防止畸形summary/files/findings（例如findings:[null]）被当作有效结果而导致页面TypeError。只做本地研发原型的可信结果边界，不增加依赖、不触碰后端扫描规则或资源限制、不访问外部扫描目标。三轮共用单独开发分支和草稿PR，每轮DeepSeek开发→GitHub证据→GLM独立审查→DeepSeek整改，再开始下一轮；第三轮停止，人工审查批准后才可合并。严格限制每轮小范围文件和GitHub证据预算。",
   "allowed_roots": [
     "frontend/src/",
     "frontend/tests/",
     "backend/"
   ],
   "allowed_suffixes": [
-    ".py",
     ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".css",
-    ".json"
+    ".tsx"
   ],
   "round_focus": [
-    "先读取当前 main 的网页源码，核对文件过滤已完成的实际状态。实现少量可解释、可离线复现的静态规则与统一 Finding 字段（规则ID、严重度、文件相对路径、行号、证据、解释与修复建议）；只对明确代码模式报告，不宣称完整漏洞确认。补 backend/tests/test_*.py 的标准库 unittest 功能与反例测试。保持现有接口和前端测试通过；不增加依赖。报告现有不足和下一步建议。",
-    "前序固定验证通过后，沿用现有 FastAPI 结构接入本地代码文本静态扫描 API、明确的任务状态和 Findings JSON。先检查已有后端依赖；不新增依赖。对文件数量、相对路径、文本体积和敏感文件做服务端独立校验，不信任浏览器过滤，不允许任意本地路径读取或执行上传代码。同步补纯逻辑测试；保留 /health。需要环境或产品决策时暂停提问。",
-    "前序固定验证通过后，让现有 React 页面把用户筛选后的允许代码文本提交给本地 API，显示加载、失败、空结果、任务状态与 Finding 文件/行号/证据，并提供 JSON 结果查看或导出。保持被排除文件不可提交，保留原文件过滤显示，补关键前端纯逻辑测试。运行既有测试、构建、lint 与后端测试。如前序尚未稳定，优先修复并如实报告未完成项，不制造完成状态。"
+    "第一轮：只修改frontend/src/scanApi.ts与frontend/tests/scanApi.test.ts。对成功响应ScanResponse做完整的运行时深层类型检查：task_id非空字符串；status枚举；summary的四项计数均为非负安全整数；files每项为对象且file_path字符串、status枚举、finding_count非负安全整数、reason为字符串或null；findings每项为对象且rule_id/severity/file_path/evidence/explanation/recommendation为正确类型、line为正安全整数，severity限制为high/medium/low/info。拒绝null、数组冒充对象、缺字段和错误类型；非法200响应统一抛ScanRequestError并显示中文提示。至少新增有效最小完整响应与findings:[null]、summary:{}的可复现测试。不要触碰后端/依赖/其他功能。",
+    "第二轮：仅对上一轮前端响应校验补充小规模负例和契约回归，优先测试files:[null]、非法状态/严重度、缺失字段、负数或非整数计数、invalid line，以及成功和失败HTTP的既有行为；仅在真实缺陷证据成立时改frontend/src/scanApi.ts，测试只改frontend/tests/scanApi.test.ts。保留原有状态映射、网络异常处理和合法响应兼容；不为凑改动增加功能，不引入新依赖。",
+    "第三轮：仅在frontend/src/scanApi.ts、frontend/tests/scanApi.test.ts、确有证据必要时frontend/src/App.tsx范围内做结果页错误路径/回归收尾，确认畸形HTTP200不能进入success与Finding.map渲染、应通过既有错误路径返回可读提示；补最小测试覆盖，不引入新框架或端到端浏览器方案。运行原有前端14项及新增测试、build、lint、后端原有45项，逐项报告实际结果；如没有真实浏览器验收则明确未做。第三轮开发/审查/整改完整结束后自动停止，不自动合并，不启动第四轮。"
   ]
 }
