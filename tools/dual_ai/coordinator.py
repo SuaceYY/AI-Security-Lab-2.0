@@ -75,7 +75,7 @@ def declared_docs_path(body: str) -> str:
     )
     candidates = set()
     for declaration in declaration_re.finditer(body):
-        line_end = body.find("\\n", declaration.start())
+        line_end = body.find("\n", declaration.start())
         if line_end < 0:
             line_end = len(body)
         # Inspect the whole declared line so a list such as
@@ -92,12 +92,11 @@ def declared_docs_path(body: str) -> str:
     allowed_path = candidates.pop()
     if (
         ".." in allowed_path.split("/")
-        or not re.fullmatch(r"docs/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.md", allowed_path)
+        or not re.fullmatch(r"docs/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.md", allowed_path)
         or allowed_path.startswith("docs//")
     ):
         raise ValueError("invalid allowed docs path")
     return allowed_path
-
 
 def task_from_output(output: str) -> dict:
     markers = list(TASK_MARKER_RE.finditer(output))
