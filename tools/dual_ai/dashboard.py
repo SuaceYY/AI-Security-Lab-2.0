@@ -66,7 +66,7 @@ async function refresh(){
   else if(low.includes('session for issue'))ds.push(bubble('ds','DeepSeek · 会话已建立','已创建执行会话。'));
   else if(low.includes('running fixed verification'))ds.push(bubble('ds','DeepSeek · 验证','正在执行固定验证。'));
   else if(low.includes('succeeded with commit')){
-    ds.push(bubble('ds','DeepSeek · 已交付','任务完成并创建 PR。\n'+line.match(/https:\/\/\S+/)?.[0]));
+    ds.push(bubble('ds','DeepSeek · 已交付','任务完成并创建 PR。\\n'+line.match(/https:\/\/\S+/)?.[0]));
   }else if(low.includes('failed'))ds.push(bubble('ds','DeepSeek · 失败',line));
  }
  if(ds.length===0)ds.push(bubble('ds','DeepSeek · 等待','尚未采集到当前任务的执行事件。'));
