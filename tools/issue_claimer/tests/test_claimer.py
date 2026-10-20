@@ -207,6 +207,10 @@ class StagingTests(TempDataTest):
                 return ok("ai/issue-2\n")
             if args == ["rev-parse", "HEAD"]:
                 return ok("base-sha\n")
+            if args == ["remote", "get-url", "origin"]:
+                return ok("https://github.com/SuaceYY/AI-Security-Lab-2.0.git\n")
+            if args == ["config", "--local", "--list"]:
+                return ok("user.name=Test\n")
             if args[:2] == ["diff", "--cached"]:
                 return ok()
             return ok()
@@ -233,6 +237,66 @@ class StagingTests(TempDataTest):
         commit.assert_not_called()
         push.assert_not_called()
         self.assertEqual(state["tasks"]["2"]["status"], "failed")
+
+
+class RepositoryStateTests(TempDataTest):
+    def test_origin_change_is_rejected(self) -> None:
+        def fake_git(args: list[str], timeout: int = 120) -> m.CommandResult:
+            if args == ["branch", "--show-current"]:
+                return ok("ai/issue-2\n")
+            if args == ["rev-parse", "HEAD"]:
+                return ok("base-sha\n")
+            if args == ["remote", "get-url", "origin"]:
+                return ok("https://example.invalid/attacker.git\n")
+            if args == ["config", "--local", "--list"]:
+                return ok("user.name=Test\n")
+            return ok()
+
+        with mock.patch.object(m, "git", side_effect=fake_git):
+            with self.assertRaises(m.TaskError):
+                m.ensure_task_repository_state(
+                    "ai/issue-2",
+                    "base-sha",
+                    "https://github.com/SuaceYY/AI-Security-Lab-2.0.git",
+                    "user.name=Test\n",
+                )
+
+    def test_git_config_change_is_rejected(self) -> None:
+        def fake_git(args: list[str], timeout: int = 120) -> m.CommandResult:
+            if args == ["branch", "--show-current"]:
+                return ok("ai/issue-2\n")
+            if args == ["rev-parse", "HEAD"]:
+                return ok("base-sha\n")
+            if args == ["remote", "get-url", "origin"]:
+                return ok("https://github.com/SuaceYY/AI-Security-Lab-2.0.git\n")
+            if args == ["config", "--local", "--list"]:
+                return ok("user.name=Changed\n")
+            return ok()
+
+        with mock.patch.object(m, "git", side_effect=fake_git):
+            with self.assertRaises(m.TaskError):
+                m.ensure_task_repository_state(
+                    "ai/issue-2",
+                    "base-sha",
+                    "https://github.com/SuaceYY/AI-Security-Lab-2.0.git",
+                    "user.name=Test\n",
+                )
+
+    def test_unexpected_error_marks_task_failed(self) -> None:
+        state = {"tasks": {}, "first_run_completed": False, "last_poll_at": None}
+        issue = {"number": 2, "title": "test", "state": "OPEN", "labels": []}
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state"),
+            mock.patch.object(m, "write_checkpoint") as checkpoint,
+            mock.patch.object(m, "git", side_effect=RuntimeError("boom")),
+        ):
+            with self.assertRaises(m.StopWorker):
+                m.process_issue(issue)
+
+        self.assertEqual(state["tasks"]["2"]["status"], "failed")
+        self.assertIn("RuntimeError", state["tasks"]["2"]["failure_reason"])
+        checkpoint.assert_called()
 
 
 class CheckpointTests(TempDataTest):

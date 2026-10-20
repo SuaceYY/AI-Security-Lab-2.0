@@ -586,6 +586,17 @@ def list_ready_issues() -> list[dict[str, Any]]:
     return sorted(issues, key=issue_number)
 
 
+def read_origin_url() -> str:
+    return require_ok(git(["remote", "get-url", "origin"]), "read origin remote")
+
+
+def read_local_git_config() -> str:
+    result = git(["config", "--local", "--list"])
+    if result.returncode != 0:
+        raise TaskError(f"cannot read local git config: {trim(result.stderr)}")
+    return result.stdout
+
+
 def preflight(require_opencode: bool = True) -> dict[str, str]:
     required = ["git", "gh"]
     if require_opencode:
@@ -602,7 +613,7 @@ def preflight(require_opencode: bool = True) -> dict[str, str]:
     if Path(root).resolve() != PROJECT_ROOT.resolve():
         raise TaskError(f"unexpected git root: {root}")
 
-    remote = require_ok(git(["remote", "get-url", "origin"]), "read origin remote")
+    remote = read_origin_url()
     if REPO.lower() not in remote.lower():
         raise TaskError(f"origin does not point to {REPO}: {remote}")
 
@@ -783,7 +794,19 @@ def collect_changed_paths() -> list[str]:
     return sorted({path for path in paths if path})
 
 
-def ensure_task_repository_state(expected_branch: str, base_sha: str) -> None:
+def ensure_git_environment(expected_origin: str, expected_config: str) -> None:
+    if read_origin_url() != expected_origin:
+        raise TaskError("task changed the origin remote; refusing to continue")
+    if read_local_git_config() != expected_config:
+        raise TaskError("task changed local Git configuration; refusing to continue")
+
+
+def ensure_task_repository_state(
+    expected_branch: str,
+    base_sha: str,
+    expected_origin: str,
+    expected_config: str,
+) -> None:
     branch = require_ok(git(["branch", "--show-current"]), "read current branch")
     if branch != expected_branch:
         raise TaskError(
@@ -792,6 +815,7 @@ def ensure_task_repository_state(expected_branch: str, base_sha: str) -> None:
     head = require_ok(git(["rev-parse", "HEAD"]), "read current commit")
     if head != base_sha:
         raise TaskError("task changed repository history; refusing to continue")
+    ensure_git_environment(expected_origin, expected_config)
     staged = git(["diff", "--cached", "--name-only", "-z"])
     if staged.returncode != 0:
         raise TaskError(f"inspect staged files failed: {trim(staged.stderr)}")
@@ -1080,7 +1104,7 @@ def process_issue(issue: dict[str, Any]) -> None:
     title = str(issue.get("title") or "")
     branch = branch_name(number)
     state = load_state()
-    original_branch = git(["branch", "--show-current"]).stdout.strip()
+    original_branch = ""
 
     task: dict[str, Any] = {
         "issue_number": number,
@@ -1105,6 +1129,10 @@ def process_issue(issue: dict[str, Any]) -> None:
     task_deadline = time.monotonic() + TASK_TIMEOUT_SECONDS
 
     try:
+        original_branch = require_ok(
+            git(["branch", "--show-current"]),
+            "read original branch",
+        )
         ensure_clean_worktree()
 
         exists, detail = remote_claim_exists(number)
@@ -1117,6 +1145,12 @@ def process_issue(issue: dict[str, Any]) -> None:
             "create task branch",
         )
         base_sha = require_ok(git(["rev-parse", "HEAD"]), "read base commit")
+        origin_baseline = read_origin_url()
+        if REPO.lower() not in origin_baseline.lower():
+            raise TaskError(
+                f"origin does not point to {REPO}: {origin_baseline}"
+            )
+        config_baseline = read_local_git_config()
         task["stage"] = "branch_created"
         task["next_step"] = "run OpenCode and fixed verification"
         save_state(state)
@@ -1156,7 +1190,12 @@ def process_issue(issue: dict[str, Any]) -> None:
                 logger.warning("attempt %s failed: %s", attempt, trim(previous_error, 500))
                 continue
 
-            ensure_task_repository_state(branch, base_sha)
+            ensure_task_repository_state(
+                branch,
+                base_sha,
+                origin_baseline,
+                config_baseline,
+            )
             changed = collect_changed_paths()
             validate_task_paths(changed)
 
@@ -1189,7 +1228,12 @@ def process_issue(issue: dict[str, Any]) -> None:
                 f"task failed after {MAX_ATTEMPTS} attempts: {trim(previous_error)}"
             )
 
-        ensure_task_repository_state(branch, base_sha)
+        ensure_task_repository_state(
+            branch,
+            base_sha,
+            origin_baseline,
+            config_baseline,
+        )
         stage_and_validate_changes(changed)
         task["stage"] = "staged"
         task["next_step"] = "create task commit"
@@ -1204,6 +1248,7 @@ def process_issue(issue: dict[str, Any]) -> None:
         save_state(state)
         write_checkpoint(task, task["stage"], task["next_step"], task["tests"])
 
+        ensure_git_environment(origin_baseline, config_baseline)
         push_branch(branch)
         task["stage"] = "pushed"
         task["next_step"] = "open pull request"
@@ -1257,6 +1302,23 @@ def process_issue(issue: dict[str, Any]) -> None:
         if isinstance(exc, StopWorker):
             raise
         raise StopWorker(f"task #{number} failed") from exc
+    except Exception as exc:
+        task["status"] = "failed"
+        task["stage"] = "failed"
+        task["failure_reason"] = trim(f"{type(exc).__name__}: {exc}")
+        task["next_step"] = "manual review required; unexpected error"
+        task["updated_at"] = utc_now()
+        finalize_first_run(state)
+        save_state(state)
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task["tests"],
+            recovery_command(),
+        )
+        logger.exception("issue #%s failed unexpectedly", number)
+        raise StopWorker(f"task #{number} failed unexpectedly") from exc
 
 
 def recover_stale_tasks() -> bool:
