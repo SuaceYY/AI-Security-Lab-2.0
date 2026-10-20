@@ -13,6 +13,9 @@ from tools.dual_ai.web_batch import (
 )
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
+# Legacy offline tests intentionally exercise Python code edits. The active batch
+# plan can be narrower; never relax its production scope to satisfy a test.
+PLAN["allowed_suffixes"] = [".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".json"]
 
 
 class Bridge:
