@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -158,6 +159,13 @@ class CommandResult:
 class VerificationResult:
     ok: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class VerificationStep:
+    label: str
+    command: tuple[str, ...]
+    cwd: Path
 
 
 def utc_now() -> str:
@@ -755,6 +763,35 @@ def check_sensitive_paths(paths: list[str]) -> None:
             raise TaskError(f"planned commit contains sensitive filename: {path}")
 
 
+def is_link_or_reparse(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TaskError(f"cannot inspect path component {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def validate_path_components(path: str) -> None:
+    relative = Path(path)
+    if relative.is_absolute():
+        raise TaskError(f"planned commit uses an absolute path: {path}")
+    current = PROJECT_ROOT
+    for part in relative.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise TaskError(f"planned commit escapes the repository: {path}")
+        current = current / part
+        if is_link_or_reparse(current):
+            raise TaskError(f"planned commit contains a symlink or reparse point: {path}")
+
+
 def validate_task_paths(paths: list[str]) -> None:
     if not paths:
         raise TaskError("task produced no file changes")
@@ -766,11 +803,13 @@ def validate_task_paths(paths: list[str]) -> None:
     check_sensitive_paths(paths)
     total_bytes = 0
     for path in paths:
-        candidate = (PROJECT_ROOT / path).resolve()
+        validate_path_components(path)
+        try:
+            candidate = (PROJECT_ROOT / path).resolve()
+        except OSError as exc:
+            raise TaskError(f"cannot resolve planned commit path {path}: {exc}") from exc
         if candidate != PROJECT_ROOT and PROJECT_ROOT not in candidate.parents:
             raise TaskError(f"planned commit escapes the repository: {path}")
-        if candidate.is_symlink():
-            raise TaskError(f"planned commit contains a symlink: {path}")
         if candidate.is_file():
             total_bytes += candidate.stat().st_size
             if total_bytes > MAX_STAGED_BYTES:
@@ -1041,59 +1080,208 @@ def recovery_command() -> str:
     return f'opencode run --dir "{PROJECT_ROOT}" --continue'
 
 
+FRONTEND_FILES = {
+    "frontend/.oxlintrc.json",
+    "frontend/index.html",
+    "frontend/package-lock.json",
+    "frontend/package.json",
+    "frontend/tsconfig.app.json",
+    "frontend/tsconfig.json",
+    "frontend/tsconfig.node.json",
+    "frontend/vite.config.ts",
+}
+FRONTEND_PREFIXES = (
+    "frontend/public/",
+    "frontend/src/",
+    "frontend/tests/",
+)
+ACTIONS_WORKFLOW_PREFIX = ".github/workflows/"
+
+
+def classify_changed_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip("/")
+    if normalized in FRONTEND_FILES or normalized.startswith(FRONTEND_PREFIXES):
+        return "frontend"
+    if (
+        normalized.startswith(ACTIONS_WORKFLOW_PREFIX)
+        and Path(normalized).parent.as_posix() == ".github/workflows"
+        and Path(normalized).suffix.lower() in {".yml", ".yaml"}
+    ):
+        return "actions"
+    raise TaskError(f"no fixed verification plan for changed path: {path}")
+
+
+def validate_actions_workflow(path: Path) -> None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TaskError(f"cannot read workflow {path.name}: {exc}") from exc
+    if not text.strip():
+        raise TaskError(f"workflow is empty: {path.name}")
+    if "\x00" in text:
+        raise TaskError(f"workflow contains a NUL byte: {path.name}")
+
+    lines = text.splitlines()
+    if any("\t" in line for line in lines):
+        raise TaskError(f"workflow contains tab indentation: {path.name}")
+    active_lines = [line for line in lines if not line.lstrip().startswith("#")]
+    active = "\n".join(active_lines)
+
+    top_level: set[str] = set()
+    for line in active_lines:
+        if not line or line[0].isspace():
+            continue
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)", line)
+        if match:
+            top_level.add(match.group(1))
+    missing = {"name", "on", "permissions", "jobs"} - top_level
+    if missing:
+        raise TaskError(
+            f"workflow is missing top-level keys {sorted(missing)}: {path.name}"
+        )
+
+    def top_level_block(key: str) -> list[str]:
+        block: list[str] = []
+        collecting = False
+        for line in active_lines:
+            if re.match(rf"^{re.escape(key)}:\s*$", line):
+                collecting = True
+                continue
+            if collecting:
+                if line and not line[0].isspace():
+                    break
+                block.append(line)
+        return block
+
+    if "pull_request_target" in active:
+        raise TaskError(f"workflow uses pull_request_target: {path.name}")
+    if not re.search(r"(?m)^\s*pull_request\s*:", active) and not re.search(
+        r"(?m)^on:\s*[^\n]*\bpull_request\b", active
+    ):
+        raise TaskError(f"workflow is not triggered by pull_request: {path.name}")
+    if re.search(r"(?m)^\s*permissions:\s*write-all\s*$", active):
+        raise TaskError(f"workflow requests write-all permissions: {path.name}")
+    permissions = top_level_block("permissions")
+    if not any(re.match(r"^\s+contents:\s*read\s*$", line) for line in permissions):
+        raise TaskError(f"workflow must grant contents: read: {path.name}")
+    if any(re.match(r"^\s+[A-Za-z0-9_-]+:\s*write\s*$", line) for line in permissions):
+        raise TaskError(f"workflow requests write permissions: {path.name}")
+    if re.search(r"(?m)^\s+contents:\s*write\s*$", active):
+        raise TaskError(f"workflow requests contents: write: {path.name}")
+    if "secrets." in active:
+        raise TaskError(f"workflow references secrets: {path.name}")
+    jobs = top_level_block("jobs")
+    if not any(re.match(r"^  [A-Za-z0-9_-]+:\s*$", line) for line in jobs):
+        raise TaskError(f"workflow has no jobs: {path.name}")
+    if not re.search(r"(?m)^\s+runs-on:\s*ubuntu-latest\s*$", active):
+        raise TaskError(f"workflow must use ubuntu-latest: {path.name}")
+    if not re.search(r"(?m)^\s+node-version:\s*['\"]?24(?:\.x)?['\"]?\s*$", active):
+        raise TaskError(f"workflow must use Node.js 24: {path.name}")
+    if not re.search(r"(?m)\bnpm ci\b", active):
+        raise TaskError(f"workflow must run npm ci: {path.name}")
+    if not re.search(r"\bnode --test\s+tests/fileFilter\.test\.ts\b", active):
+        raise TaskError(f"workflow must run the frontend tests: {path.name}")
+    if not re.search(r"\bnpm run build\b", active):
+        raise TaskError(f"workflow must run npm run build: {path.name}")
+    if not re.search(r"\bnpm run lint\b", active):
+        raise TaskError(f"workflow must run npm run lint: {path.name}")
+    if not re.search(r"working-directory:\s*frontend|cd\s+frontend\b", active):
+        raise TaskError(f"workflow must run in the frontend directory: {path.name}")
+
+
+def build_verification_plan(
+    changed_paths: list[str],
+) -> tuple[list[VerificationStep], str]:
+    if not changed_paths:
+        return [], "task produced no file changes"
+    if not VERIFICATION_COMMANDS:
+        return [], "no fixed verification commands are configured"
+
+    steps = [
+        VerificationStep(
+            f"fixed verification {index}",
+            tuple(command),
+            PROJECT_ROOT,
+        )
+        for index, command in enumerate(VERIFICATION_COMMANDS, start=1)
+    ]
+    categories: set[str] = set()
+    action_paths: list[Path] = []
+    for path in changed_paths:
+        try:
+            category = classify_changed_path(path)
+        except TaskError as exc:
+            return [], str(exc)
+        categories.add(category)
+        if category == "actions":
+            action_paths.append(PROJECT_ROOT / path)
+
+    if "frontend" in categories:
+        frontend_root = PROJECT_ROOT / "frontend"
+        if not (frontend_root / "package.json").is_file():
+            return [], "frontend/package.json is missing"
+        if not (frontend_root / "package-lock.json").is_file():
+            return [], "frontend/package-lock.json is missing"
+        npm = shutil.which("npm")
+        node = shutil.which("node")
+        if not npm:
+            return [], "npm is not available for frontend verification"
+        if not node:
+            return [], "node is not available for frontend verification"
+        steps.extend(
+            [
+                VerificationStep("frontend dependency install", (npm, "ci"), frontend_root),
+                VerificationStep(
+                    "frontend tests",
+                    (node, "--test", "tests/fileFilter.test.ts"),
+                    frontend_root,
+                ),
+                VerificationStep("frontend build", (npm, "run", "build"), frontend_root),
+                VerificationStep("frontend lint", (npm, "run", "lint"), frontend_root),
+            ]
+        )
+
+    for path in action_paths:
+        if not path.is_file():
+            return [], f"changed workflow does not exist: {path.name}"
+        try:
+            validate_actions_workflow(path)
+        except TaskError as exc:
+            return [], str(exc)
+
+    return steps, ""
+
+
 def run_verification(
     changed_paths: list[str],
     timeout: int,
 ) -> VerificationResult:
-    if not VERIFICATION_COMMANDS:
-        return VerificationResult(False, "no fixed verification commands are configured")
+    steps, error = build_verification_plan(changed_paths)
+    if error:
+        return VerificationResult(False, error)
 
     deadline = time.monotonic() + timeout
     logger = logging.getLogger("issue_claimer")
-    for command in VERIFICATION_COMMANDS:
+    for step in steps:
         remaining = int(deadline - time.monotonic())
         if remaining <= 0:
             return VerificationResult(False, "verification exceeded its timeout")
-        logger.info("running fixed verification command: %s", command[0])
+        logger.info("running fixed verification step: %s", step.label)
         result = run_command(
-            list(command),
-            cwd=PROJECT_ROOT,
+            list(step.command),
+            cwd=step.cwd,
             timeout=remaining,
             env=sanitized_opencode_env(),
         )
         if result.timed_out:
-            return VerificationResult(False, "verification command timed out")
+            return VerificationResult(False, f"{step.label} timed out")
         if result.returncode != 0:
             return VerificationResult(
                 False,
-                f"verification failed: {trim(result.stderr or result.stdout)}",
+                f"{step.label} failed: {trim(result.stderr or result.stdout)}",
             )
 
-    for path in changed_paths:
-        if not path.endswith(".py"):
-            continue
-        candidate = PROJECT_ROOT / path
-        if not candidate.is_file():
-            continue
-        remaining = int(deadline - time.monotonic())
-        if remaining <= 0:
-            return VerificationResult(False, "verification exceeded its timeout")
-        logger.info("compiling changed Python file: %s", path)
-        result = run_command(
-            [sys.executable, "-m", "py_compile", path],
-            cwd=PROJECT_ROOT,
-            timeout=min(remaining, 120),
-            env=sanitized_opencode_env(),
-        )
-        if result.timed_out:
-            return VerificationResult(False, f"compile timed out: {path}")
-        if result.returncode != 0:
-            return VerificationResult(
-                False,
-                f"compile failed for {path}: {trim(result.stderr or result.stdout)}",
-            )
-
-    return VerificationResult(True, "fixed verification commands passed")
+    return VerificationResult(True, "fixed verification matrix passed")
 
 
 def switch_back(original_branch: str) -> None:
@@ -1224,6 +1412,11 @@ def process_issue(issue: dict[str, Any]) -> None:
                 logger.warning("attempt %s verification failed", attempt)
                 continue
 
+            post_verification = collect_changed_paths()
+            if post_verification != changed:
+                raise TaskError(
+                    "verification changed the working tree; refusing to commit"
+                )
             task["stage"] = f"verified_attempt_{attempt}"
             task["next_step"] = "stage and commit verified changes"
             save_state(state)

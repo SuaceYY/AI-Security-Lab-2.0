@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -150,11 +152,106 @@ class CommandSafetyTests(TempDataTest):
         failure = m.CommandResult(1, "", "tests failed")
         with (
             mock.patch.object(m, "VERIFICATION_COMMANDS", (("safe",),)),
+            mock.patch.object(m.shutil, "which", return_value="/fixed/tool"),
             mock.patch.object(m, "run_command", return_value=failure),
         ):
-            result = m.run_verification([], 5)
+            result = m.run_verification(["frontend/src/App.tsx"], 5)
         self.assertFalse(result.ok)
         self.assertIn("tests failed", result.detail)
+
+
+class VerificationMatrixTests(TempDataTest):
+    def test_frontend_plan_uses_fixed_commands(self) -> None:
+        calls: list[tuple[list[str], Path]] = []
+
+        def fake_run(
+            command: list[str],
+            cwd: Path,
+            timeout: int,
+            env: dict[str, str] | None = None,
+        ) -> m.CommandResult:
+            calls.append((list(command), cwd))
+            return ok()
+
+        with (
+            mock.patch.object(m.shutil, "which", side_effect=lambda name: f"/fixed/{name}"),
+            mock.patch.object(m, "run_command", side_effect=fake_run),
+        ):
+            result = m.run_verification(["frontend/src/App.tsx"], 60)
+
+        self.assertTrue(result.ok, result.detail)
+        expected = [
+            list(m.VERIFICATION_COMMANDS[0]),
+            ["/fixed/npm", "ci"],
+            ["/fixed/node", "--test", "tests/fileFilter.test.ts"],
+            ["/fixed/npm", "run", "build"],
+            ["/fixed/npm", "run", "lint"],
+        ]
+        self.assertEqual([command for command, _ in calls], expected)
+        frontend = m.PROJECT_ROOT / "frontend"
+        self.assertTrue(all(cwd == frontend for _, cwd in calls[1:]))
+
+    def test_unknown_path_fails_closed(self) -> None:
+        with mock.patch.object(m, "run_command") as runner:
+            result = m.run_verification(["README.md"], 5)
+        self.assertFalse(result.ok)
+        self.assertIn("no fixed verification plan", result.detail)
+        runner.assert_not_called()
+
+    def test_actions_workflow_is_statically_validated(self) -> None:
+        valid = """name: frontend-ci
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: node --test tests/fileFilter.test.ts
+      - run: npm run build
+      - run: npm run lint
+"""
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            workflow = workflows / "frontend-ci.yml"
+            workflow.write_text(valid, encoding="utf-8")
+
+            with (
+                mock.patch.object(m, "PROJECT_ROOT", root),
+                mock.patch.object(m, "run_command", return_value=ok()),
+            ):
+                result = m.run_verification(
+                    [".github/workflows/frontend-ci.yml"],
+                    5,
+                )
+
+            self.assertTrue(result.ok, result.detail)
+
+            workflow.write_text(
+                valid.replace("contents: read", "contents: write"),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(m, "PROJECT_ROOT", root),
+                mock.patch.object(m, "run_command", return_value=ok()),
+            ):
+                invalid = m.run_verification(
+                    [".github/workflows/frontend-ci.yml"],
+                    5,
+                )
+            self.assertFalse(invalid.ok)
+            self.assertIn("contents: read", invalid.detail)
 
     def test_context_exhaustion_is_detected(self) -> None:
         result = m.CommandResult(1, "", "context window exceeded")
@@ -177,6 +274,76 @@ class StagingTests(TempDataTest):
         ):
             with self.subTest(path=path), self.assertRaises(m.TaskError):
                 m.check_sensitive_paths([path])
+
+    def test_symlink_file_is_rejected_before_resolution(self) -> None:
+        root = Path(tempfile.mkdtemp(dir=m.PROJECT_ROOT))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        target = root / "target.txt"
+        target.write_text("target", encoding="utf-8")
+        link = root / "link.txt"
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        relative = link.relative_to(m.PROJECT_ROOT).as_posix()
+        with self.assertRaises(m.TaskError):
+            m.validate_task_paths([relative])
+
+    def test_symlink_component_is_rejected_before_resolution(self) -> None:
+        root = Path(tempfile.mkdtemp(dir=m.PROJECT_ROOT))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        target = root / "target"
+        target.mkdir()
+        (target / "file.txt").write_text("target", encoding="utf-8")
+        link = root / "linked"
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        relative = (link / "file.txt").relative_to(m.PROJECT_ROOT).as_posix()
+        with self.assertRaises(m.TaskError):
+            m.validate_task_paths([relative])
+
+    def test_original_path_symlink_metadata_is_rejected(self) -> None:
+        real_lstat = m.os.lstat
+
+        def fake_lstat(path: Path) -> object:
+            if Path(path).name == "App.tsx":
+                return mock.Mock(st_mode=m.stat.S_IFLNK, st_file_attributes=0)
+            return real_lstat(path)
+
+        with mock.patch.object(m.os, "lstat", side_effect=fake_lstat):
+            with self.assertRaises(m.TaskError):
+                m.validate_task_paths(["frontend/src/App.tsx"])
+
+    def test_link_metadata_detects_symlink_and_reparse_point(self) -> None:
+        symlink = mock.Mock(st_mode=m.stat.S_IFLNK, st_file_attributes=0)
+        reparse = mock.Mock(
+            st_mode=m.stat.S_IFREG,
+            st_file_attributes=getattr(
+                m.stat,
+                "FILE_ATTRIBUTE_REPARSE_POINT",
+                0x400,
+            ),
+        )
+        regular = mock.Mock(st_mode=m.stat.S_IFREG, st_file_attributes=0)
+        for info, expected in ((symlink, True), (reparse, True), (regular, False)):
+            with self.subTest(expected=expected):
+                with mock.patch.object(m.os, "lstat", return_value=info):
+                    self.assertEqual(
+                        m.is_link_or_reparse(Path("candidate")),
+                        expected,
+                    )
+
+    def test_reparse_point_component_is_rejected(self) -> None:
+        def fake_reparse(path: Path) -> bool:
+            return Path(path).name == "frontend"
+
+        with mock.patch.object(m, "is_link_or_reparse", side_effect=fake_reparse):
+            with self.assertRaises(m.TaskError):
+                m.validate_task_paths(["frontend/src/App.tsx"])
 
     def test_staging_uses_explicit_paths_not_add_all(self) -> None:
         calls: list[list[str]] = []
