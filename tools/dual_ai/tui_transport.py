@@ -49,7 +49,8 @@ class TUIClient:
             username = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
             encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
             headers["Authorization"] = f"Basic {encoded}"
-        url = self.base_url + path + "?" + urlencode({"directory": self.project_dir})
+        separator = "&" if "?" in path else "?"
+        url = self.base_url + path + separator + urlencode({"directory": self.project_dir})
         request = Request(url, data=data, headers=headers, method=method)
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
@@ -98,3 +99,42 @@ class TUIClient:
         cleared = self._request("POST", "/tui/clear-prompt")
         if cleared is not True:
             raise TUITransportError("TUI did not confirm prompt clearing")
+    @staticmethod
+    def _validate_session_id(session_id: str) -> str:
+        import re
+        if not isinstance(session_id, str) or not re.fullmatch(r"ses_[A-Za-z0-9_-]+", session_id):
+            raise ValueError("invalid OpenCode session ID")
+        return session_id
+
+    def get_session(self, session_id: str) -> dict:
+        session_id = self._validate_session_id(session_id)
+        result = self._request("GET", f"/session/{session_id}")
+        if not isinstance(result, dict) or result.get("id") != session_id:
+            raise TUITransportError("OpenCode did not return the bound session")
+        directory = result.get("directory")
+        if not isinstance(directory, str) or os.path.normcase(os.path.realpath(directory)) != os.path.normcase(self.project_dir):
+            raise TUITransportError("bound session directory does not match the repository")
+        return result
+
+    def get_session_status(self, session_id: str) -> str:
+        session_id = self._validate_session_id(session_id)
+        result = self._request("GET", "/session/status")
+        if not isinstance(result, dict) or session_id not in result:
+            raise TUITransportError("OpenCode did not return status for the bound session")
+        status = result[session_id]
+        if isinstance(status, str):
+            kind = status
+        elif isinstance(status, dict):
+            kind = status.get("type", status.get("status"))
+        else:
+            kind = None
+        if kind not in {"idle", "busy", "retry"}:
+            raise TUITransportError("OpenCode returned an unknown session status")
+        return kind
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        session_id = self._validate_session_id(session_id)
+        result = self._request("GET", f"/session/{session_id}/message?limit=100")
+        if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+            raise TUITransportError("OpenCode returned an invalid session message list")
+        return result
