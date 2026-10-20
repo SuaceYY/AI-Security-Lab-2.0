@@ -102,11 +102,11 @@ def run_prompt(
 
     # The attached TUI observes this exact session while the server runs the call.
     # Model and session are explicit; an ambiguous POST is never retried.
+    tag = "GLM" if role == "planner" else "DeepSeek"
+    print(f"[{tag}] sending prompt to the bound visible TUI session now.", file=output, flush=True)
     response = client.send_session_message(
         session_id, prompt, str(binding.get("model") or ""), timeout=timeout + 5
     )
-    tag = "GLM" if role == "planner" else "DeepSeek"
-    print(f"[{tag}] prompt submitted to the bound visible TUI session; watch the native window.", file=output, flush=True)
     if message_role(response) != "assistant":
         raise TUITransportError("OpenCode returned a non-assistant response")
     verify_response_model(response, str(binding.get("model") or ""))
