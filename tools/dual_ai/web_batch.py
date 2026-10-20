@@ -125,12 +125,15 @@ def check_scope(paths: list[str], plan: dict) -> None:
             raise HumanRequired("文件超出本批网页开发范围：" + str(path))
 
 
-def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None, review_report_ref=None) -> dict:
+def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None, review_report_ref=None,
+              captured_development=None) -> dict:
     """The bridge owns real IO; tests can verify ordering without model calls."""
     validate_plan(plan)
     if (type(first_round) is not int or not 1 <= first_round <= ROUNDS
-            or (first_round != 1 and development_report_ref is None and review_report_ref is None)
-            or (development_report_ref is not None and review_report_ref is not None)):
+            or (first_round != 1 and development_report_ref is None and review_report_ref is None
+                and captured_development is None)
+            or sum(v is not None for v in (development_report_ref, review_report_ref,
+                                            captured_development)) > 1):
         raise HumanRequired("恢复轮次不合法，禁止清零重跑。")
     last = None
     for number in range(first_round, ROUNDS + 1):
@@ -139,6 +142,8 @@ def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None,
         else:
             if number == first_round and development_report_ref is not None:
                 report_ref = development_report_ref
+            elif number == first_round and captured_development is not None:
+                report_ref = bridge.publish(number, "development", captured_development)
             else:
                 development = bridge.develop(number, plan["round_focus"][number - 1], last)
                 report_ref = bridge.publish(number, "development", development)
@@ -167,9 +172,11 @@ def main(argv=None) -> int:
     parser.add_argument("--resume-completed-review", action="store_true", help="reuse the recorded GLM reply after result-format failure")
     parser.add_argument("--resume-format-compatibility", action="store_true",
                         help="one explicit continuation after the recorded tool-free formatter FreeTierError")
+    parser.add_argument("--resume-verified-development", action="store_true",
+                        help="reuse one verified and committed DeepSeek development after snapshot-scope error")
     args = parser.parse_args(argv)
     if sum((args.resume_completed_review, args.resume_format_compatibility,
-            args.resume_from_report is not None)) > 1:
+            args.resume_from_report is not None, args.resume_verified_development)) > 1:
         parser.error("choose only one recovery mode")
     resume_review = args.resume_completed_review or args.resume_format_compatibility
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", args.batch_id):
@@ -193,12 +200,14 @@ def main(argv=None) -> int:
     plan = validate_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))
     bridge = WebBatch(args.batch_id, plan, resume_report_ref=args.resume_from_report,
                       resume_completed_review=resume_review,
-                      resume_format_compatibility=args.resume_format_compatibility)
+                      resume_format_compatibility=args.resume_format_compatibility,
+                      resume_verified_development=args.resume_verified_development)
     try:
         with bridge:
-            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if (args.resume_from_report or resume_review) else 1,
+            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if (args.resume_from_report or resume_review or args.resume_verified_development) else 1,
                                development_report_ref=args.resume_from_report,
-                               review_report_ref=bridge.state.get("resume_review_ref") if resume_review else None)
+                               review_report_ref=bridge.state.get("resume_review_ref") if resume_review else None,
+                               captured_development=bridge.recovered_capture if args.resume_verified_development else None)
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         print("三轮批次已停止。请联系主审助手核对 GitHub 进度、证据与可行度，再取得下一批启动指令。", flush=True)
         return 0
