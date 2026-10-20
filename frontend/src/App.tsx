@@ -1,9 +1,24 @@
 ﻿import { useEffect, useState } from 'react'
 import { filterFiles, type FilterResult } from './fileFilter.ts'
+import {
+  describeScanResult,
+  formatScanError,
+  formatTaskStatus,
+  readAllowedFiles,
+  submitScan,
+  type ScanResponse,
+} from './scanApi.ts'
+
+type ScanState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'success'; result: ScanResponse }
+  | { kind: 'error'; message: string }
 
 function App() {
   const [status, setStatus] = useState('检查中...')
   const [result, setResult] = useState<FilterResult<File> | null>(null)
+  const [scanState, setScanState] = useState<ScanState>({ kind: 'idle' })
 
   useEffect(() => {
     fetch('/api/health')
@@ -12,8 +27,24 @@ function App() {
       .catch(() => setStatus('后端连接失败'))
   }, [])
 
+  const handleScan = async () => {
+    if (!result || result.allowed.length === 0) {
+      setScanState({ kind: 'error', message: '没有可提交的允许文件，请重新选择。' })
+      return
+    }
+
+    setScanState({ kind: 'loading' })
+    try {
+      const files = await readAllowedFiles(result.allowed)
+      const scanResult = await submitScan(files)
+      setScanState({ kind: 'success', result: scanResult })
+    } catch (error) {
+      setScanState({ kind: 'error', message: formatScanError(error) })
+    }
+  }
+
   return (
-    <main style={{ padding: 40, maxWidth: 800, margin: 'auto' }}>
+    <main style={{ padding: 40, maxWidth: 900, margin: 'auto' }}>
       <h1>AI-Security-Lab 2.0</h1>
       <p>本地 AI 代码安全审计平台</p>
       <p>系统状态：{status}</p>
@@ -24,10 +55,12 @@ function App() {
       <input
         type="file"
         multiple
+        disabled={scanState.kind === 'loading'}
         {...{ webkitdirectory: '' }}
         onChange={event => {
           const selected = Array.from(event.target.files || [])
           setResult(filterFiles(selected))
+          setScanState({ kind: 'idle' })
         }}
       />
 
@@ -59,7 +92,79 @@ function App() {
             </ul>
           )}
 
-          <p>文件过滤仅在浏览器本地进行，不会上传或执行任何文件。</p>
+          <p>
+            允许文件只在点击“开始静态扫描”后以文本提交到本地 API；排除文件不会提交，也不会执行任何文件。
+          </p>
+
+          <button
+            type="button"
+            onClick={handleScan}
+            disabled={scanState.kind === 'loading' || result.allowed.length === 0}
+          >
+            {scanState.kind === 'loading' ? '扫描中...' : '开始静态扫描'}
+          </button>
+
+          {result.allowed.length === 0 && <p>没有允许文件，无法提交扫描。</p>}
+
+          {scanState.kind === 'loading' && <p>正在提交并扫描允许文件...</p>}
+
+          {scanState.kind === 'error' && <p role="alert">错误：{scanState.message}</p>}
+
+          {scanState.kind === 'success' && (
+            <>
+              <h3>扫描结果</h3>
+              <p>
+                任务状态：{formatTaskStatus(scanState.result.status)}（
+                {scanState.result.status}）
+              </p>
+              <p>{describeScanResult(scanState.result)}</p>
+              <p>
+                扫描文件：{scanState.result.summary.scanned_count}，跳过：
+                {scanState.result.summary.skipped_count}，问题数：
+                {scanState.result.summary.finding_count}
+              </p>
+
+              {scanState.result.findings.length === 0 ? (
+                <p>未发现匹配的静态规则。</p>
+              ) : (
+                <ul style={{ textAlign: 'left', paddingLeft: 20 }}>
+                  {scanState.result.findings.map(finding => (
+                    <li
+                      key={`${finding.file_path}:${finding.line}:${finding.rule_id}`}
+                      style={{ marginBottom: 16 }}
+                    >
+                      <div>
+                        <code>
+                          {finding.file_path}:{finding.line}
+                        </code>{' '}
+                        [{finding.severity}] {finding.rule_id}
+                      </div>
+                      <div>
+                        证据：<code>{finding.evidence}</code>
+                      </div>
+                      <div>{finding.explanation}</div>
+                      <div>建议：{finding.recommendation}</div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <details style={{ marginTop: 16, textAlign: 'left' }}>
+                <summary>查看 JSON 结果</summary>
+                <pre
+                  style={{
+                    maxHeight: 400,
+                    overflow: 'auto',
+                    padding: 12,
+                    background: '#f4f4f4',
+                    textAlign: 'left',
+                  }}
+                >
+                  {JSON.stringify(scanState.result, null, 2)}
+                </pre>
+              </details>
+            </>
+          )}
         </>
       )}
     </main>
