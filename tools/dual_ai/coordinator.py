@@ -155,9 +155,9 @@ def review_new_pr(*, write: bool, state: dict) -> None:
         if pr.get("isDraft") or not isinstance(pr.get("headRefOid"), str):
             continue
         # Only consider PRs tied to the coordinator-created Issue.
-        body = str(pr.get("body") or "")
-       if not any(linked_to_issue(body, n) for n in issue_numbers):
-    continue
+                body = str(pr.get("body") or "")
+        if not any(linked_to_issue(body, n) for n in issue_numbers):
+            continue
         number, sha = pr["number"], pr["headRefOid"]
         if existing_review(number, sha):
             print(f"[GitHub] PR #{number} already reviewed at {sha[:8]}; skip.")
