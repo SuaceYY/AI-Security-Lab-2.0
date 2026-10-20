@@ -55,7 +55,7 @@ def format_comment(pr_number: int, sha: str, verdict: dict) -> str:
     return (
         f"<!-- dual-ai-glm-review sha={sha} -->\n"
         f"### GLM independent review — PR #{pr_number}\n\n"
-        f"**Verdict:** \`{verdict['status']}\`\n\n"
+        f"**Verdict:** `{verdict['status']}`\n\n"
         f"**Reason:** {verdict['reason']}\n\n"
         "AI review is advisory. Human approval and merge are required.\n"
     )
