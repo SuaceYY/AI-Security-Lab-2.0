@@ -1,5 +1,7 @@
 """GitHub handoff and staging boundaries without subprocesses or model calls."""
 import json
+import base64
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,7 @@ from unittest.mock import patch, Mock
 
 from tools.dual_ai.web_batch import HumanRequired
 from tools.dual_ai.web_batch_runtime import WebBatch, FENCE
+from tools.issue_claimer import claimer as worker
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
 RUNTIME = "tools.dual_ai.web_batch_runtime."
@@ -104,6 +107,54 @@ class RuntimeTests(unittest.TestCase):
             with patch(RUNTIME + "commit_changes") as commit, self.assertRaises(HumanRequired):
                 batch.capture(1, "development", "report", {})
             commit.assert_not_called()
+
+    def test_real_git_commit_push_and_next_guard_preserve_staging_and_tracking(self):
+        # Real local repositories only; GitHub, validation and models are mocked.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "project"
+            remote = Path(folder) / "remote.git"
+            root.mkdir()
+            def git(*args):
+                completed = subprocess.run(["git", *args], cwd=root, capture_output=True,
+                                           text=True, encoding="utf-8", check=True)
+                return completed.stdout.strip()
+            git("init", "-b", "main")
+            git("config", "user.name", "Offline Test")
+            git("config", "user.email", "test@example.invalid")
+            for path in ("frontend/src/App.tsx", "frontend/src/fileFilter.ts", "backend/main.py"):
+                file = root / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("# baseline\n", encoding="utf-8")
+            (root / ".gitignore").write_text("/data/\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "base")
+            git("init", "--bare", str(remote))
+            git("remote", "add", "origin", str(remote))
+            git("push", "origin", "main")
+            base = git("rev-parse", "HEAD")
+            git("switch", "-c", "ai/web-web-test-001", "origin/main")
+            batch = self.batch(root / "data")
+            batch.base_sha = base
+            batch.head = base
+            def api(path, *args):
+                if path == "pulls":
+                    return {"number": 7}
+                relative = path.split("contents/", 1)[1].split("?ref=", 1)[0]
+                return {"sha": "test-blob", "content": base64.b64encode((root / relative).read_bytes()).decode()}
+            batch.api = api
+            batch.verify = Mock(return_value={"ok": True, "steps": []})
+            with patch(RUNTIME + "ROOT", root), \
+                 patch.object(worker, "PROJECT_ROOT", root), \
+                 patch.object(worker, "DATA_DIR", root / "data"):
+                batch.origin = worker.read_origin_url()
+                batch.config = worker.read_local_git_config()
+                (root / "backend/scanner.py").write_text("def scan(): return []\n", encoding="utf-8")
+                result = batch.capture(1, "development", "offline test", {"status": "done"})
+                self.assertEqual(result["pr"], 7)
+                self.assertNotEqual(batch.head, base)
+                self.assertEqual(git("diff", "--cached", "--name-only"), "")
+                self.assertEqual(batch.guard(), [])
+                self.assertEqual(git("rev-parse", "origin/ai/web-web-test-001"), batch.head)
 
 
 if __name__ == "__main__":
