@@ -33,6 +33,24 @@ MAX_TASKS = 3
 MAX_ROUNDS = 3
 
 
+class TaskBudget:
+    """Bound Issue creation within one coordinator process, not across restarts."""
+
+    def __init__(self, limit: int = MAX_TASKS):
+        if limit < 0:
+            raise ValueError("task budget limit must not be negative")
+        self.limit = limit
+        self.created = 0
+
+    def has_capacity(self) -> bool:
+        return self.created < self.limit
+
+    def record_created(self) -> None:
+        if not self.has_capacity():
+            raise ValueError("task budget exhausted")
+        self.created += 1
+
+
 def run_visible_role(role: str, prompt: str, *, output=None, timeout: int = 300) -> int:
     try:
         run_prompt(role, prompt, output=output, timeout=timeout)
@@ -185,8 +203,8 @@ def existing_task_history(issues: list[dict]) -> tuple[str, set[str], set[str]]:
     return "\n".join(rows) if rows else "- 无历史任务记录", keys, paths
 
 
-def create_next_issue(*, write: bool, state: dict) -> None:
-    if len(state.get("created", [])) >= MAX_TASKS:
+def create_next_issue(*, write: bool, state: dict, task_budget: TaskBudget | None = None) -> None:
+    if task_budget is not None and not task_budget.has_capacity():
         print("[Coordinator] Task budget reached; no new Issue.")
         return
     roadmap = roadmap_text()
@@ -241,6 +259,8 @@ def create_next_issue(*, write: bool, state: dict) -> None:
     save_state(state)
     # Only after durable checkpoint do we mark it ready for the existing worker.
     gh("issue", "edit", str(number), "--add-label", "ai-ready")
+    if task_budget is not None:
+        task_budget.record_created()
     print(f"[GitHub] Created and queued Issue #{number}: {url}")
 
 
@@ -515,10 +535,10 @@ def review_new_pr(*, write: bool, state: dict) -> None:
     print("[Coordinator] No matching new PR; existing DeepSeek worker handles execution.")
 
 
-def tick(*, write: bool) -> None:
+def tick(*, write: bool, task_budget: TaskBudget | None = None) -> None:
     state = load_state()
     if not state.get("created"):
-        create_next_issue(write=write, state=state)
+        create_next_issue(write=write, state=state, task_budget=task_budget)
         return
     latest_issue = state["created"][-1]
     # A human-merged PR explicitly linked to the last Issue is the only
@@ -532,11 +552,8 @@ def tick(*, write: bool) -> None:
         if linked_to_issue(str(pr.get("body") or ""), latest_issue)
     ]
     if linked:
-        if len(state["created"]) >= MAX_TASKS:
-            print("[Coordinator] Human merge observed; task budget reached. Stop.")
-            return
         print(f"[Coordinator] Issue #{latest_issue} merged; next planning gate.")
-        create_next_issue(write=write, state=state)
+        create_next_issue(write=write, state=state, task_budget=task_budget)
         return
     review_new_pr(write=write, state=state)
 
@@ -555,9 +572,10 @@ def main() -> int:
         parser.error("minimum polling interval is 60 seconds")
     if not args.once and not args.write:
         parser.error("continuous mode requires explicit --write")
+    task_budget = TaskBudget()
     try:
         while True:
-            tick(write=args.write)
+            tick(write=args.write, task_budget=task_budget)
             if args.once:
                 return 0
             time.sleep(args.interval)

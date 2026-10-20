@@ -182,6 +182,25 @@ class CoordinatorTests(unittest.TestCase):
         create.assert_called_once()
         review.assert_not_called()
 
+    def test_task_budget_is_bounded_per_process_and_resets_on_restart(self):
+        first_run = coordinator.TaskBudget()
+        for _ in range(coordinator.MAX_TASKS):
+            first_run.record_created()
+        self.assertFalse(first_run.has_capacity())
+
+        next_run = coordinator.TaskBudget()
+        self.assertTrue(next_run.has_capacity())
+        self.assertEqual(next_run.created, 0)
+
+    @patch.object(coordinator, "gh_json", return_value=[
+        {"number": 25, "body": "Automated implementation for issue #24.", "mergedAt": "2026-10-20T00:00:00Z"}
+    ])
+    @patch.object(coordinator, "create_next_issue")
+    @patch.object(coordinator, "load_state", return_value={"created": [10, 15, 24]})
+    def test_process_budget_does_not_stop_after_cumulative_history_limit(self, load, create, github):
+        coordinator.tick(write=True, task_budget=coordinator.TaskBudget())
+        create.assert_called_once()
+
     def test_worker_pr_link(self):
         self.assertTrue(coordinator.linked_to_issue(
             "Automated implementation for issue #42.\\n\\n- Branch: ai/issue-42", 42))
