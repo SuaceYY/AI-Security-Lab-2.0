@@ -66,7 +66,7 @@ def task_from_output(output: str) -> dict:
         raise ValueError("invalid title")
     if not isinstance(task["body"], str) or not 80 <= len(task["body"]) <= 9000:
         raise ValueError("invalid body")
-        body = task["body"]
+    body = task["body"]
 
     # Extract the explicitly declared allowed modification path.
     match = re.search(
