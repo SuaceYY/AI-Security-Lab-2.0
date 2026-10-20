@@ -68,6 +68,29 @@ class IssueSelectionTests(TempDataTest):
         self.assertFalse(eligible)
         self.assertIn("already recorded", reason)
 
+    def test_failed_task_is_not_claimed_again(self) -> None:
+        for status, stage in (
+            ("failed", "failed"),
+            ("timed_out", "timed_out"),
+            ("failed", "recovery_required"),
+        ):
+            with self.subTest(status=status, stage=stage):
+                state = {
+                    "tasks": {"2": {"status": status, "stage": stage}},
+                    "first_run_completed": True,
+                }
+                issue = {
+                    "number": 2,
+                    "state": "OPEN",
+                    "labels": [{"name": "ai-ready"}],
+                }
+                with mock.patch.object(
+                    m, "remote_claim_exists", return_value=(False, "")
+                ):
+                    eligible, reason = m.evaluate_issue(state, issue)
+                self.assertFalse(eligible)
+                self.assertIn("already recorded", reason)
+
     def test_fetch_issue_uses_gh_json(self) -> None:
         payload = json.dumps(
             {
@@ -102,6 +125,31 @@ class LockTests(TempDataTest):
         first.release()
         self.assertTrue(second.acquire())
         second.release()
+
+    def test_default_lock_uses_patched_path_not_import_time_default(self) -> None:
+        production_lock = m.PROJECT_ROOT / "data" / "issue_claimer" / "claimer.lock"
+        lock = m.InstanceLock()
+        self.assertEqual(lock.path, m.LOCK_FILE)
+        self.assertNotEqual(lock.path, production_lock)
+        self.assertTrue(lock.acquire())
+        try:
+            self.assertTrue(m.LOCK_FILE.exists())
+            self.assertTrue(m.instance_is_running())
+        finally:
+            lock.release()
+        self.assertFalse(m.instance_is_running())
+
+    def test_default_lock_is_independent_when_another_worker_holds_a_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as other_dir:
+            worker_lock = m.InstanceLock(Path(other_dir) / "claimer.lock")
+            self.assertTrue(worker_lock.acquire())
+            try:
+                probe = m.InstanceLock()
+                self.assertEqual(probe.path, m.LOCK_FILE)
+                self.assertTrue(probe.acquire())
+                probe.release()
+            finally:
+                worker_lock.release()
 
 
 class DryRunTests(TempDataTest):
@@ -532,8 +580,32 @@ class RepositoryStateTests(TempDataTest):
             with self.assertRaises(m.StopWorker):
                 m.process_issue(issue)
 
-        self.assertEqual(state["tasks"]["2"]["status"], "failed")
-        self.assertIn("RuntimeError", state["tasks"]["2"]["failure_reason"])
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["stage"], "failed")
+        self.assertIn("RuntimeError", task["failure_reason"])
+        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("completed_at", task)
+        checkpoint.assert_called()
+
+    def test_interrupt_marks_task_failed_with_recovery_details(self) -> None:
+        state = {"tasks": {}, "first_run_completed": False, "last_poll_at": None}
+        issue = {"number": 2, "title": "test", "state": "OPEN", "labels": []}
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state"),
+            mock.patch.object(m, "write_checkpoint") as checkpoint,
+            mock.patch.object(m, "git", side_effect=KeyboardInterrupt()),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                m.process_issue(issue)
+
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["stage"], "interrupted")
+        self.assertIn("KeyboardInterrupt", task["failure_reason"])
+        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("completed_at", task)
         checkpoint.assert_called()
 
 
@@ -561,7 +633,14 @@ class CheckpointTests(TempDataTest):
 
     def test_recovery_marks_stale_running_task_failed(self) -> None:
         state = {
-            "tasks": {"2": {"status": "running", "stage": "opencode_attempt_1"}},
+            "tasks": {
+                "2": {
+                    "status": "running",
+                    "stage": "opencode_attempt_1",
+                    "tests": "not_run",
+                    "recovery_count": 0,
+                }
+            },
             "first_run_completed": False,
         }
         with (
@@ -571,10 +650,47 @@ class CheckpointTests(TempDataTest):
         ):
             self.assertTrue(m.recover_stale_tasks())
 
-        self.assertEqual(state["tasks"]["2"]["status"], "failed")
-        self.assertEqual(state["tasks"]["2"]["stage"], "recovery_required")
+        task = state["tasks"]["2"]
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["stage"], "recovery_required")
+        self.assertEqual(task["previous_stage"], "opencode_attempt_1")
+        self.assertIn("previous worker stopped", task["failure_reason"])
+        self.assertIn("opencode run", task["recovery"])
+        self.assertIn("recovered_at", task)
+        self.assertEqual(task["recovery_count"], 1)
+        self.assertTrue(state["first_run_completed"])
         save.assert_called_once()
         checkpoint.assert_called_once()
+        self.assertEqual(checkpoint.call_args.args[4], task["recovery"])
+
+    def test_recovery_is_not_repeated_and_task_stays_unclaimable(self) -> None:
+        state = {
+            "tasks": {
+                "2": {
+                    "status": "running",
+                    "stage": "opencode_attempt_1",
+                    "recovery_count": 0,
+                }
+            },
+            "first_run_completed": False,
+        }
+        with (
+            mock.patch.object(m, "load_state", return_value=state),
+            mock.patch.object(m, "save_state") as save,
+            mock.patch.object(m, "write_checkpoint"),
+        ):
+            self.assertTrue(m.recover_stale_tasks())
+            self.assertFalse(m.recover_stale_tasks())
+
+        task = state["tasks"]["2"]
+        self.assertEqual(task["recovery_count"], 1)
+        self.assertEqual(task["stage"], "recovery_required")
+        save.assert_called_once()
+
+        issue = {"number": 2, "state": "OPEN", "labels": [{"name": "ai-ready"}]}
+        eligible, reason = m.evaluate_issue(state, issue)
+        self.assertFalse(eligible)
+        self.assertIn("already recorded", reason)
 
 
 if __name__ == "__main__":

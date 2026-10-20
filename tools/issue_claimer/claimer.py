@@ -172,6 +172,12 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def touch_task(task: dict[str, Any]) -> None:
+    timestamp = utc_now()
+    task["updated_at"] = timestamp
+    task["last_heartbeat_at"] = timestamp
+
+
 def redact(text: str) -> str:
     value = text or ""
     for _, pattern in SECRET_CONTENT_PATTERNS:
@@ -341,8 +347,8 @@ def is_pid_alive(pid: int) -> bool:
 
 
 class InstanceLock:
-    def __init__(self, path: Path = LOCK_FILE) -> None:
-        self.path = path
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else LOCK_FILE
         self._fd: int | None = None
 
     def acquire(self) -> bool:
@@ -1315,6 +1321,10 @@ def process_issue(issue: dict[str, Any]) -> None:
         "next_step": "create task branch",
         "started_at": utc_now(),
         "updated_at": utc_now(),
+        "last_heartbeat_at": utc_now(),
+        "worker_pid": os.getpid(),
+        "recovery": "",
+        "recovery_count": 0,
         "failure_reason": None,
     }
     state["tasks"][str(number)] = task
@@ -1470,7 +1480,9 @@ def process_issue(issue: dict[str, Any]) -> None:
         task["stage"] = "timed_out"
         task["failure_reason"] = trim(str(exc))
         task["next_step"] = "inspect worktree and resume manually"
-        task["updated_at"] = utc_now()
+        task["recovery"] = recovery_command()
+        task["completed_at"] = utc_now()
+        touch_task(task)
         finalize_first_run(state)
         save_state(state)
         write_checkpoint(
@@ -1478,7 +1490,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["stage"],
             task["next_step"],
             task["tests"],
-            recovery_command(),
+            task["recovery"],
         )
         logger.error("issue #%s timed out: %s", number, trim(str(exc)))
         raise StopWorker(f"task #{number} timed out") from exc
@@ -1487,7 +1499,9 @@ def process_issue(issue: dict[str, Any]) -> None:
         task["stage"] = "failed"
         task["failure_reason"] = trim(str(exc))
         task["next_step"] = "manual review required; do not rerun automatically"
-        task["updated_at"] = utc_now()
+        task["recovery"] = recovery_command()
+        task["completed_at"] = utc_now()
+        touch_task(task)
         finalize_first_run(state)
         save_state(state)
         write_checkpoint(
@@ -1495,7 +1509,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["stage"],
             task["next_step"],
             task["tests"],
-            recovery_command(),
+            task["recovery"],
         )
         logger.error("issue #%s failed: %s", number, trim(str(exc)))
         if isinstance(exc, StopWorker):
@@ -1506,7 +1520,9 @@ def process_issue(issue: dict[str, Any]) -> None:
         task["stage"] = "failed"
         task["failure_reason"] = trim(f"{type(exc).__name__}: {exc}")
         task["next_step"] = "manual review required; unexpected error"
-        task["updated_at"] = utc_now()
+        task["recovery"] = recovery_command()
+        task["completed_at"] = utc_now()
+        touch_task(task)
         finalize_first_run(state)
         save_state(state)
         write_checkpoint(
@@ -1514,7 +1530,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["stage"],
             task["next_step"],
             task["tests"],
-            recovery_command(),
+            task["recovery"],
         )
         logger.error(
             "issue #%s failed unexpectedly: %s",
@@ -1522,6 +1538,29 @@ def process_issue(issue: dict[str, Any]) -> None:
             trim(str(exc)),
         )
         raise StopWorker(f"task #{number} failed unexpectedly") from exc
+    except BaseException as exc:
+        task["status"] = "failed"
+        task["stage"] = "interrupted"
+        task["failure_reason"] = trim(f"{type(exc).__name__}: {exc}")
+        task["next_step"] = "manual review required; worker was interrupted"
+        task["recovery"] = recovery_command()
+        task["completed_at"] = utc_now()
+        touch_task(task)
+        finalize_first_run(state)
+        save_state(state)
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task["tests"],
+            task["recovery"],
+        )
+        logger.error(
+            "issue #%s was interrupted: %s",
+            number,
+            trim(f"{type(exc).__name__}: {exc}"),
+        )
+        raise
 
 
 def recover_stale_tasks() -> bool:
@@ -1536,13 +1575,33 @@ def recover_stale_tasks() -> bool:
         return False
 
     for number, task in stale:
+        previous_stage = task.get("stage")
+        task["previous_stage"] = previous_stage
         task["status"] = "failed"
         task["stage"] = "recovery_required"
-        task["failure_reason"] = "previous worker stopped before completing the task"
-        task["next_step"] = "inspect worktree and handoff before manual recovery"
-        task["updated_at"] = utc_now()
-        logger.error("found stale running task #%s; marked as failed", number)
-        write_checkpoint(task, task["stage"], task["next_step"], task.get("tests", "unknown"))
+        task["failure_reason"] = (
+            "previous worker stopped before completing the task "
+            f"(last stage: {previous_stage or 'unknown'})"
+        )
+        task["next_step"] = (
+            "manual review required; inspect worktree and handoff before recovery"
+        )
+        task["recovery"] = recovery_command()
+        task["recovered_at"] = utc_now()
+        task["recovery_count"] = int(task.get("recovery_count") or 0) + 1
+        touch_task(task)
+        logger.error(
+            "found stale running task #%s at stage %s; marked as failed",
+            number,
+            previous_stage or "unknown",
+        )
+        write_checkpoint(
+            task,
+            task["stage"],
+            task["next_step"],
+            task.get("tests", "unknown"),
+            task["recovery"],
+        )
     finalize_first_run(state)
     save_state(state)
     return True
