@@ -7,9 +7,11 @@ export interface ScanRequest {
   files: ScanFileInput[]
 }
 
+export type ScanSeverity = 'high' | 'medium' | 'low' | 'info'
+
 export interface ScanFinding {
   rule_id: string
-  severity: string
+  severity: ScanSeverity
   file_path: string
   line: number
   evidence: string
@@ -42,6 +44,10 @@ export interface ScanResponse {
 export interface TextFileLike {
   text(): Promise<string>
 }
+
+const TASK_STATUSES: readonly ScanResponse['status'][] = ['queued', 'running', 'done', 'failed']
+const FILE_STATUSES: readonly ScannedFile['status'][] = ['scanned', 'skipped']
+const SEVERITIES: readonly ScanSeverity[] = ['high', 'medium', 'low', 'info']
 
 const TASK_STATUS_LABELS: Record<ScanResponse['status'], string> = {
   queued: '排队中',
@@ -78,19 +84,72 @@ export class ScanRequestError extends Error {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isOneOf<T extends string>(value: unknown, options: readonly T[]): value is T {
+  return typeof value === 'string' && (options as readonly string[]).includes(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+
+function isScanSummary(value: unknown): value is ScanSummary {
+  return (
+    isRecord(value) &&
+    isNonNegativeSafeInteger(value.file_count) &&
+    isNonNegativeSafeInteger(value.scanned_count) &&
+    isNonNegativeSafeInteger(value.skipped_count) &&
+    isNonNegativeSafeInteger(value.finding_count)
+  )
+}
+
+function isScannedFile(value: unknown): value is ScannedFile {
+  return (
+    isRecord(value) &&
+    typeof value.file_path === 'string' &&
+    isOneOf(value.status, FILE_STATUSES) &&
+    isNonNegativeSafeInteger(value.finding_count) &&
+    isNullableString(value.reason)
+  )
+}
+
+function isScanFinding(value: unknown): value is ScanFinding {
+  return (
+    isRecord(value) &&
+    typeof value.rule_id === 'string' &&
+    isOneOf(value.severity, SEVERITIES) &&
+    typeof value.file_path === 'string' &&
+    isPositiveSafeInteger(value.line) &&
+    typeof value.evidence === 'string' &&
+    typeof value.explanation === 'string' &&
+    typeof value.recommendation === 'string'
+  )
 }
 
 function isScanResponse(value: unknown): value is ScanResponse {
-  if (!isRecord(value) || typeof value.task_id !== 'string' || typeof value.status !== 'string') {
-    return false
-  }
-
   return (
-    ['queued', 'running', 'done', 'failed'].includes(value.status) &&
-    isRecord(value.summary) &&
+    isRecord(value) &&
+    isNonEmptyString(value.task_id) &&
+    isOneOf(value.status, TASK_STATUSES) &&
+    isScanSummary(value.summary) &&
     Array.isArray(value.files) &&
-    Array.isArray(value.findings)
+    value.files.every(isScannedFile) &&
+    Array.isArray(value.findings) &&
+    value.findings.every(isScanFinding)
   )
 }
 
