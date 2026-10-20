@@ -172,7 +172,7 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.task_from_output(line)
 
     @patch.object(coordinator, "gh_json", return_value=[
-        {"number": 25, "body": "Automated implementation for issue #42.", "mergedAt": "2026-10-20T00:00:00Z"}
+        {"number": 25, "body": "Automated implementation for issue #24.", "mergedAt": "2026-10-20T00:00:00Z"}
     ])
     @patch.object(coordinator, "review_new_pr")
     @patch.object(coordinator, "create_next_issue")
