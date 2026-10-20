@@ -121,6 +121,22 @@ class VisibleContextTests(unittest.TestCase):
         self.assertEqual(set(checked), {"planner", "executor"})
         self.assertTrue(all(method == "GET" for method, _, _ in client.calls))
 
+    def test_format_only_disables_every_tool_even_for_executor(self):
+        client = Client()
+        self.session(client).call("executor", "only format", format_only=True)
+        body = next(b for _, p, b in client.calls if p.endswith("/message"))
+        self.assertEqual(body["agent"], "plan")
+        self.assertTrue(body["tools"])
+        self.assertFalse(any(body["tools"].values()))
+
+    def test_text_part_boundaries_preserve_result_marker(self):
+        client = Client()
+        client.response["parts"] = [{"type": "text", "text": "analysis"},
+                                    {"type": "reasoning", "text": "never parse reasoning"},
+                                    {"type": "text", "text": "WEB_BATCH_RESULT: {}"}]
+        text = self.session(client).call("executor", "task")
+        self.assertEqual(text, "analysis\nWEB_BATCH_RESULT: {}")
+
     def test_monitor_failure_aborts_exact_request_without_retry(self):
         client = Client()
         original = client._request

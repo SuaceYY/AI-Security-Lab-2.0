@@ -242,6 +242,130 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("readable_pages", stored[ref])
             self.assertTrue((Path(folder) / batch.batch_id / "report-2-development.json").is_file())
 
+    def formatted_result(self, status="pass"):
+        return {"status": status, "summary": "原结论", "instructions": ["原建议"], "question": ""}
+
+    def test_format_recovery_is_once_tool_free_and_does_not_replay_task(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            batch.fingerprint = Mock(return_value="same")
+            corrected = "WEB_BATCH_RESULT: " + json.dumps(self.formatted_result())
+            batch.sessions = Mock()
+            batch.sessions.call.return_value = corrected
+            result = batch.result(3, "review", "planner", "原结论为通过，但结果格式写错")
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(batch.sessions.call.call_count, 1)
+            self.assertEqual(batch.sessions.call.call_args.kwargs, {"format_only": True})
+            self.assertTrue((Path(folder) / batch.batch_id / "response-3-review.json").exists())
+            batch.sessions.call.reset_mock()
+            with self.assertRaises(HumanRequired):
+                batch.result(3, "review", "planner", "still invalid")
+            batch.sessions.call.assert_not_called()
+
+    def test_invalid_formatter_does_not_loop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            batch.fingerprint = Mock(return_value="same")
+            batch.sessions = Mock()
+            batch.sessions.call.return_value = "invalid again"
+            with self.assertRaises(HumanRequired):
+                batch.result(2, "repair", "executor", "invalid first")
+            self.assertEqual(batch.sessions.call.call_count, 1)
+
+    def test_human_or_conflicting_verdict_never_enters_formatter(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            batch.sessions = Mock()
+            human = self.formatted_result("needs_human")
+            human["question"] = "permission needed"
+            text = "WEB_BATCH_RESULT: " + json.dumps(human)
+            for reply in (text, text + "\nWEB_BATCH_RESULT: " + json.dumps(self.formatted_result())):
+                with self.assertRaises(HumanRequired):
+                    batch.result(3, "review", "planner", reply)
+            batch.sessions.call.assert_not_called()
+
+    def test_formatter_worktree_change_stops(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            batch.fingerprint = Mock(side_effect=["before", "after"])
+            batch.sessions = Mock()
+            batch.sessions.call.return_value = "WEB_BATCH_RESULT: " + json.dumps(self.formatted_result())
+            with self.assertRaisesRegex(HumanRequired, "仓库发生修改"):
+                batch.result(1, "development", "executor", "bad format")
+
+    def review_recovery_fixture(self, root):
+        batch = self.batch(root)
+        head = "a" * 40
+        bindings = {"planner": "ses_glm", "executor": "ses_ds"}
+        previous = dict(batch.state, phase="needs_human", action="review", last_phase="development",
+                        last_report_id=99, round=3, rounds_completed=2, head_sha=head, base_sha="b" * 40,
+                        branch=batch.branch, issue=33, pr=34, sessions=bindings,
+                        question="模型未返回唯一的 WEB_BATCH_RESULT，需人工核对会话。",
+                        context_events=[{"round": 3, "phase": "model_usage",
+                                         "data": {"role": "planner", "message_id": "msg_review"}}])
+        batch.path.write_text(json.dumps(previous), encoding="utf-8")
+        source = {"files": {}}
+        report = {"batch_id": batch.batch_id, "round": 3, "phase": "development", "pr": 34,
+                  "head_sha": head, "verification": {"ok": True}, "source": source,
+                  "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True,
+                                                          ensure_ascii=False).encode()).hexdigest()}
+        batch.fetch = Mock(return_value=report)
+        marker = "<!-- web-batch=" + batch.batch_id + " round=3 phase=review_started -->"
+        batch.api = Mock(side_effect=lambda path, *args:
+                         [[{"body": marker}]] if "/comments?" in path else
+                         {"state": "open", "head": {"sha": head}})
+        batch.guard = Mock()
+        batch.publish = Mock(return_value=123)
+        text = "**WEB_BATCH_RESULT:** " + json.dumps(self.formatted_result())
+        response = {"info": {"role": "assistant", "id": "msg_review", "sessionID": "ses_glm",
+                             "providerID": "provider", "modelID": "glm", "cost": 0},
+                    "parts": [{"type": "text", "text": text}]}
+        session = Mock()
+        session.session_ids = bindings
+        client = Mock()
+        client._request.return_value = response
+        session.client.return_value = (client, {"session_id": "ses_glm", "model": "provider/glm"})
+        return batch, head, session, client
+
+    def test_completed_review_recovery_uses_exact_get_not_another_review(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head, session, client = self.review_recovery_fixture(Path(folder))
+            def command(args):
+                return "feature/web-three-cycle-batch" if args[0] == "branch" else head if args[0] == "rev-parse" else ""
+            with patch(RUNTIME + "ensure_clean_worktree"), \
+                 patch(RUNTIME + "command", side_effect=command), \
+                 patch(RUNTIME + "read_origin_url", return_value="https://github.com/SuaceYY/AI-Security-Lab-2.0"), \
+                 patch(RUNTIME + "read_local_git_config", return_value="config"), \
+                 patch(RUNTIME + "backend_python", return_value={"executable": "existing-env"}), \
+                 patch(RUNTIME + "VisibleWebSessions", return_value=session):
+                self.assertIs(batch.enter_resume_review(), batch)
+            self.assertEqual(batch.state["rounds_completed"], 2)
+            self.assertEqual(batch.state["round"], 3)
+            self.assertEqual(batch.state["resume_review_ref"], 123)
+            client._request.assert_called_once_with("GET", "/session/ses_glm/message/msg_review")
+            session.call.assert_not_called()
+            review = batch.publish.call_args.args[2]
+            self.assertEqual(review["model_result"]["status"], "pass")
+            self.assertEqual(review["reused_message_id"], "msg_review")
+            batch.publish.assert_called_once()
+
+    def test_recovery_refuses_prior_repair_dispatch_without_state_overwrite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head, session, client = self.review_recovery_fixture(Path(folder))
+            previous = batch.path.read_text(encoding="utf-8")
+            prefix = "<!-- web-batch=" + batch.batch_id + " round=3 phase="
+            batch.api = Mock(return_value=[[{"body": prefix + "review_started -->"},
+                                           {"body": prefix + "repair_started -->"}]])
+            with patch(RUNTIME + "ensure_clean_worktree"), \
+                 patch(RUNTIME + "command", return_value="feature/web-three-cycle-batch"), \
+                 patch(RUNTIME + "read_origin_url", return_value="https://github.com/SuaceYY/AI-Security-Lab-2.0"):
+                with self.assertRaises(HumanRequired):
+                    batch.enter_resume_review()
+            batch.pause("refused")
+            self.assertEqual(batch.path.read_text(encoding="utf-8"), previous)
+            batch.publish.assert_not_called()
+            session.call.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

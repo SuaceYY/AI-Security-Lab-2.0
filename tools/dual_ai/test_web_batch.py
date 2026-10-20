@@ -121,6 +121,17 @@ class BatchContractTests(unittest.TestCase):
         self.assertEqual([n for p, n in bridge.events if p == "complete"], [2, 3])
 
 
+    def test_resume_final_review_only_repairs_then_stops(self):
+        bridge = Bridge()
+        bridge.comments["review3"] = {"published": "review", "number": 3}
+        result = run_batch(bridge, PLAN, first_round=3, review_report_ref="review3")
+        self.assertEqual(result["rounds"], 3)
+        self.assertEqual(bridge.events[0], ("fetch", "review3"))
+        self.assertFalse(any(phase in {"develop", "review"} for phase, _ in bridge.events))
+        self.assertEqual([event for event in bridge.events if event[0] in {"repair", "complete", "finish"}],
+                         [("repair", 3), ("complete", 3), ("finish", 3)])
+
+
 class ResultTests(unittest.TestCase):
     def result(self, **changes):
         data = {"status": "done", "summary": "real result", "instructions": [], "question": ""}
@@ -139,6 +150,32 @@ class ResultTests(unittest.TestCase):
                      self.result(status=[]), self.result(instructions=["x"] * 13)):
             with self.subTest(text=text[:60]), self.assertRaises(HumanRequired):
                 parse_result(text)
+
+    def test_presentation_wrappers_preserve_exact_result(self):
+        data = {"status": "pass", "summary": "真实审查", "instructions": ["保留意见"], "question": ""}
+        raw = json.dumps(data, ensure_ascii=False)
+        fence = chr(96) * 3
+        for text in ("分析结束。WEB_BATCH_RESULT: " + raw,
+                     "**WEB_BATCH_RESULT:** " + raw,
+                     "**WEB_BATCH_RESULT**：" + raw,
+                     "`WEB_BATCH_RESULT`: " + raw,
+                     "WEB_BATCH_RESULT:\n" + fence + "json\n" + raw + "\n" + fence,
+                     fence + "json\nWEB_BATCH_RESULT: " + raw + "\n" + fence,
+                     raw, fence + "json\n" + raw + "\n" + fence):
+            with self.subTest(text=text[:45]):
+                self.assertEqual(parse_result(text), data)
+
+    def test_human_request_survives_wrappers_and_trailing_prose(self):
+        text = self.result(status="needs_human", question="需要授权") + "\n格式多了一行"
+        with self.assertRaisesRegex(HumanRequired, "需要授权"):
+            parse_result(text)
+
+    def test_conflicting_results_and_duplicate_keys_remain_rejected(self):
+        with self.assertRaises(HumanRequired):
+            parse_result(self.result(status="pass") + "\n" + self.result(status="changes_requested"))
+        text = 'WEB_BATCH_RESULT: {"status":"pass","status":"done","summary":"x","instructions":[],"question":""}'
+        with self.assertRaises(HumanRequired):
+            parse_result(text)
 
 
 if __name__ == "__main__":

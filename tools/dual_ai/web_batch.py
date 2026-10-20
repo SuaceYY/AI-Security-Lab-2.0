@@ -21,28 +21,65 @@ class HumanRequired(RuntimeError):
     """An explicit operator decision or recovery is required."""
 
 
+class ResultFormatError(HumanRequired):
+    """A completed response needs format repair, not task replay."""
+
+
 def parse_result(text: str) -> dict:
-    markers = list(re.finditer(r"(?m)^[ \t]*WEB_BATCH_RESULT:[ \t]*", text))
-    if len(markers) != 1:
-        raise HumanRequired("模型未返回唯一的 WEB_BATCH_RESULT，需人工核对会话。")
+    # OpenCode text parts and Markdown need not put the marker at column zero.
+    # Only presentation wrappers are removed; JSON values are never guessed.
+    markers = list(re.finditer(r"(?<![A-Za-z0-9_])WEB_BATCH_RESULT(?![A-Za-z0-9_])", text))
+    if len(markers) > 1:
+        raise HumanRequired("模型返回多个结果标记，结论可能冲突，不能自动选取。")
+    if markers:
+        value = text[markers[0].end():].lstrip()
+        for wrapper in ("**", "`"):
+            if value.startswith(wrapper):
+                value = value[len(wrapper):].lstrip()
+                break
+        if not value.startswith((":", "：")):
+            raise ResultFormatError("模型结果标记缺少冒号。")
+        value = value[1:].lstrip()
+        if value.startswith("**"):
+            value = value[2:].lstrip()
+    else:
+        value = text.strip()
+        if not value.startswith(("{", "```")):
+            raise ResultFormatError("模型未返回可识别的 WEB_BATCH_RESULT。")
+    if value.startswith("```"):
+        match = re.match(r"```(?:json)?[ \t]*\n", value)
+        if not match:
+            raise ResultFormatError("结果代码围栏格式不合法。")
+        value = value[match.end():].lstrip()
+    def unique_keys(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
     try:
-        obj, end = json.JSONDecoder().raw_decode(text[markers[0].end():].lstrip())
+        obj, end = json.JSONDecoder(object_pairs_hook=unique_keys).raw_decode(value)
     except (ValueError, TypeError) as exc:
-        raise HumanRequired("模型的结构化结果不是有效 JSON。") from exc
-    tail = text[markers[0].end():].lstrip()[end:]
-    if tail.strip() or not isinstance(obj, dict):
-        raise HumanRequired("模型结构化结果后出现额外内容。")
+        raise ResultFormatError("模型的结构化结果不是有效 JSON。") from exc
+    # An explicit human question must never enter automatic format correction.
+    if isinstance(obj, dict) and obj.get("status") == "needs_human":
+        question = obj.get("question") or obj.get("summary")
+        raise HumanRequired(question if isinstance(question, str) else "模型要求人工处理。")
+    tail = value[end:].strip()
+    if tail not in {"", "**", "`", "```", "**\n```", "```\n**"} or not isinstance(obj, dict):
+        raise ResultFormatError("模型结构化结果后出现额外内容。")
     if set(obj) != {"status", "summary", "instructions", "question"}:
-        raise HumanRequired("模型结果字段不完整或包含未批准字段。")
+        raise ResultFormatError("模型结果字段不完整或包含未批准字段。")
     if not isinstance(obj["status"], str) or obj["status"] not in VALID_STATUSES:
-        raise HumanRequired("模型返回了未知状态。")
+        raise ResultFormatError("模型返回了未知状态。")
     if not isinstance(obj["summary"], str) or not 1 <= len(obj["summary"]) <= 3000:
-        raise HumanRequired("模型结果缺少有界总结。")
+        raise ResultFormatError("模型结果缺少有界总结。")
     if (not isinstance(obj["instructions"], list) or len(obj["instructions"]) > 12
             or any(not isinstance(x, str) or not 1 <= len(x) <= 1200 for x in obj["instructions"])):
-        raise HumanRequired("模型建议格式不合法。")
+        raise ResultFormatError("模型建议格式不合法。")
     if not isinstance(obj["question"], str) or len(obj["question"]) > 1500:
-        raise HumanRequired("人工问题格式不合法。")
+        raise ResultFormatError("人工问题格式不合法。")
     if obj["status"] == "needs_human":
         raise HumanRequired(obj["question"] or obj["summary"])
     return obj
@@ -88,23 +125,27 @@ def check_scope(paths: list[str], plan: dict) -> None:
             raise HumanRequired("文件超出本批网页开发范围：" + str(path))
 
 
-def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None) -> dict:
+def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None, review_report_ref=None) -> dict:
     """The bridge owns real IO; tests can verify ordering without model calls."""
     validate_plan(plan)
     if (type(first_round) is not int or not 1 <= first_round <= ROUNDS
-            or (first_round != 1 and development_report_ref is None)):
+            or (first_round != 1 and development_report_ref is None and review_report_ref is None)
+            or (development_report_ref is not None and review_report_ref is not None)):
         raise HumanRequired("恢复轮次不合法，禁止清零重跑。")
     last = None
     for number in range(first_round, ROUNDS + 1):
-        if number == first_round and development_report_ref is not None:
-            report_ref = development_report_ref
+        if number == first_round and review_report_ref is not None:
+            published_review = bridge.fetch(review_report_ref)
         else:
-            development = bridge.develop(number, plan["round_focus"][number - 1], last)
-            report_ref = bridge.publish(number, "development", development)
-        published_report = bridge.fetch(report_ref)
-        review = bridge.review(number, published_report)
-        review_ref = bridge.publish(number, "review", review)
-        published_review = bridge.fetch(review_ref)
+            if number == first_round and development_report_ref is not None:
+                report_ref = development_report_ref
+            else:
+                development = bridge.develop(number, plan["round_focus"][number - 1], last)
+                report_ref = bridge.publish(number, "development", development)
+            published_report = bridge.fetch(report_ref)
+            review = bridge.review(number, published_report)
+            review_ref = bridge.publish(number, "review", review)
+            published_review = bridge.fetch(review_ref)
         repair = bridge.repair(number, published_review)
         repair_ref = bridge.publish(number, "repair", repair)
         bridge.round_complete(number, repair_ref)
@@ -123,7 +164,10 @@ def main(argv=None) -> int:
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--resume-from-report", type=int, help="explicit recovery from one already-published development report")
     parser.add_argument("--check", action="store_true", help="read-only TUI compatibility check; no AI call")
+    parser.add_argument("--resume-completed-review", action="store_true", help="reuse the recorded GLM reply after result-format failure")
     args = parser.parse_args(argv)
+    if args.resume_completed_review and args.resume_from_report is not None:
+        parser.error("choose only one recovery mode")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", args.batch_id):
         parser.error("batch-id must be 5..64 lowercase letters/digits/hyphens")
     from tools.dual_ai.web_batch_runtime import WebBatch
@@ -143,11 +187,13 @@ def main(argv=None) -> int:
     if not args.write:
         parser.error("use --write to start one explicitly authorized three-cycle batch")
     plan = validate_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))
-    bridge = WebBatch(args.batch_id, plan, resume_report_ref=args.resume_from_report)
+    bridge = WebBatch(args.batch_id, plan, resume_report_ref=args.resume_from_report,
+                      resume_completed_review=args.resume_completed_review)
     try:
         with bridge:
-            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if args.resume_from_report else 1,
-                               development_report_ref=args.resume_from_report)
+            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if (args.resume_from_report or args.resume_completed_review) else 1,
+                               development_report_ref=args.resume_from_report,
+                               review_report_ref=bridge.state.get("resume_review_ref") if args.resume_completed_review else None)
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         print("三轮批次已停止。请联系主审助手核对 GitHub 进度、证据与可行度，再取得下一批启动指令。", flush=True)
         return 0

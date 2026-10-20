@@ -31,6 +31,14 @@ def context_usage(messages: list[dict]) -> tuple[int, str]:
     return (len(text) + 1) // 2, "estimated_from_transcript_chars"
 
 
+def response_text(response):
+    # Text parts are logical blocks, not streamed byte fragments. Preserve their
+    # boundary so an end marker cannot be glued to preceding prose.
+    return "\n".join(part["text"] for part in response.get("parts", [])
+                     if isinstance(part, dict) and part.get("type") == "text"
+                     and isinstance(part.get("text"), str)).strip()
+
+
 class VisibleWebSessions:
     def __init__(self, root, checkpoint, *, client_factory=TUIClient,
                  soft_context_tokens=60000, timeout=600):
@@ -122,20 +130,20 @@ class VisibleWebSessions:
             raise HumanRequired("单次任务超过上下文安全预算，请人工缩小任务。")
         return client, b
 
-    def call(self, role, prompt):
+    def call(self, role, prompt, *, format_only=False):
         client, b = self.prepare(role, prompt)
         sid = b["session_id"]
         provider_id, model_id = b["model"].split("/", 1)
         body = {
             "model": {"providerID": provider_id, "modelID": model_id},
-            "agent": "plan" if role == "planner" else "build",
+            "agent": "plan" if role == "planner" or format_only else "build",
             "parts": [{"type": "text", "text": prompt}],
         }
-        if role == "planner":
+        if role == "planner" or format_only:
             tool_ids = client._request("GET", "/experimental/tool/ids")
             if not isinstance(tool_ids, list) or any(not isinstance(t, str) for t in tool_ids):
                 raise HumanRequired("无法核对 GLM 只读工具清单。")
-            readonly = {"read", "glob", "grep", "webfetch"}
+            readonly = set() if format_only else {"read", "glob", "grep", "webfetch"}
             body["tools"] = {name: name in readonly for name in tool_ids}
         print("[" + ("GLM" if role == "planner" else "DeepSeek") + "] 可见会话：" + sid, flush=True)
         response = self.request(client, sid, "/session/" + sid + "/message", body, timeout=self.timeout)
@@ -149,13 +157,14 @@ class VisibleWebSessions:
         cost = info.get("cost")
         if isinstance(cost, (int, float)) and cost > 0:
             raise HumanRequired("本批配置为免费模型，但接口报告计费，请核对额度。")
-        text = message_text(response).strip()
+        text = response_text(response)
         if not text:
             raise HumanRequired("模型没有返回可核对的结果。")
         print(text, flush=True)
         self.checkpoint("model_usage", {
             "role": role, "session_id": sid, "message_id": info.get("id"),
             "tokens": info.get("tokens"), "reported_cost": cost,
+            "purpose": "result_format" if format_only else "task",
         })
         return text
 

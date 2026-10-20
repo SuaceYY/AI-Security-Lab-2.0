@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -16,8 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tools.dual_ai.github_evidence import gh_json
-from tools.dual_ai.web_batch import HumanRequired, check_scope, parse_result, plan_digest
-from tools.dual_ai.web_context import VisibleWebSessions
+from tools.dual_ai.web_batch import HumanRequired, ResultFormatError, check_scope, parse_result, plan_digest
+from tools.dual_ai.web_context import VisibleWebSessions, response_text
+from tools.dual_ai.visible_tui import message_role, verify_response_model
 from tools.dual_ai.web_handoff import (
     encode_payload, payload_frame, decode_payload, text_pages, bounded_comment,
 )
@@ -62,9 +64,10 @@ def command(args):
 
 
 class WebBatch:
-    def __init__(self, batch_id, plan, *, resume_report_ref=None):
+    def __init__(self, batch_id, plan, *, resume_report_ref=None, resume_completed_review=False):
         self.batch_id = batch_id
         self.resume_report_ref = resume_report_ref
+        self.resume_completed_review = resume_completed_review
         self.plan = plan
         self.path = state_path(batch_id)
         self.state = {"batch_id": batch_id, "plan_sha256": plan_digest(plan),
@@ -117,7 +120,7 @@ class WebBatch:
         save(self.path, self.state)
 
     def __enter__(self):
-        if self.path.exists() and self.resume_report_ref is None:
+        if self.path.exists() and self.resume_report_ref is None and not self.resume_completed_review:
             self.replay_refused = True
             raise HumanRequired("该 batch-id 已有记录；请先评估旧批次，禁止重启清零计数。")
         if not self.batch_lock.acquire():
@@ -126,6 +129,8 @@ class WebBatch:
             self.batch_lock.release()
             raise HumanRequired("旧 Worker 仍在运行，请先在其 PowerShell 中停止调度。")
         try:
+            if self.resume_completed_review:
+                return self.enter_resume_review()
             if self.resume_report_ref is not None:
                 return self.enter_resume()
             ensure_clean_worktree()
@@ -255,6 +260,147 @@ class WebBatch:
               "轮：从 GitHub 开发报告继续 GLM 评审，不重做开发。", flush=True)
         return self
 
+    def enter_resume_review(self):
+        """Reuse one recorded, completed GLM reply; never resend its review."""
+        self.replay_refused = True
+        if not self.path.is_file():
+            raise HumanRequired("缺少原批次状态。")
+        previous = json.loads(self.path.read_text(encoding="utf-8"))
+        number = previous.get("round")
+        if (previous.get("batch_id") != self.batch_id
+                or previous.get("plan_sha256") != plan_digest(self.plan)
+                or previous.get("phase") != "needs_human"
+                or previous.get("action") != "review"
+                or previous.get("last_phase") != "development"
+                or type(number) is not int or not 1 <= number <= 3
+                or previous.get("rounds_completed") != number - 1
+                or previous.get("review_recovery_attempts", 0) >= 1
+                or previous.get("branch") != self.branch
+                or not any(word in str(previous.get("question", ""))
+                           for word in ("WEB_BATCH_RESULT", "结构化结果", "结果标记"))):
+            raise HumanRequired("暂停点不符合已完成GLM回复的格式恢复条件。")
+        head, base = previous.get("head_sha"), previous.get("base_sha")
+        if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                or not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)
+                or any(type(previous.get(key)) is not int or previous[key] <= 0
+                       for key in ("issue", "pr", "last_report_id"))):
+            raise HumanRequired("原提交、报告或Issue/PR记录无效。")
+        ensure_clean_worktree()
+        self.original_branch = command(["branch", "--show-current"])
+        if not self.original_branch or self.original_branch == "main":
+            raise HumanRequired("请在已更新的工具分支运行恢复。")
+        self.head, self.base_sha = head, base
+        self.issue, self.pr = previous["issue"], previous["pr"]
+        self.origin = read_origin_url()
+        if not origin_matches_repo(self.origin):
+            raise HumanRequired("恢复仓库origin不匹配。")
+        pages = self.api("issues/" + str(self.issue) + "/comments?per_page=100", "--paginate", "--slurp")
+        if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+            raise HumanRequired("无法完整核对GitHub交接历史。")
+        comments = [item for page in pages for item in page if isinstance(item, dict)]
+        prefix = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase="
+        if (sum(prefix + "review_started -->" in c.get("body", "") for c in comments) != 1
+                or any(prefix + phase + " -->" in c.get("body", "")
+                       for c in comments for phase in ("review", "repair_started", "repair", "round_complete"))):
+            raise HumanRequired("本轮审查或整改已发布/投递，禁止重复执行。")
+        report = self.fetch(previous["last_report_id"])
+        if (report.get("batch_id") != self.batch_id or report.get("round") != number
+                or report.get("phase") != "development" or report.get("head_sha") != head
+                or report.get("pr") != self.pr or report.get("verification", {}).get("ok") is not True):
+            raise HumanRequired("GitHub开发报告与暂停点不一致。")
+        source_hash = hashlib.sha256(json.dumps(report["source"], sort_keys=True,
+                                               ensure_ascii=False).encode()).hexdigest()
+        if source_hash != report.get("source_hash"):
+            raise HumanRequired("GitHub源码摘要不一致。")
+        pr = self.api("pulls/" + str(self.pr))
+        if pr.get("state") != "open" or pr.get("head", {}).get("sha") != head:
+            raise HumanRequired("PR提交或状态已变化。")
+        if command(["rev-parse", self.branch]) != head:
+            raise HumanRequired("本地批次分支提交已变化。")
+        command(["fetch", "origin", self.branch])
+        if command(["rev-parse", "FETCH_HEAD"]) != head:
+            raise HumanRequired("远端批次分支提交已变化。")
+        self.backend_environment = backend_python(ROOT)
+        self.sessions = VisibleWebSessions(ROOT, self.context_checkpoint)
+        self.sessions.check()
+        if self.sessions.session_ids != previous.get("sessions"):
+            raise HumanRequired("绑定的可见会话已变化。")
+        client, binding = self.sessions.client("planner")
+        events = [event for event in previous.get("context_events", [])
+                  if event.get("round") == number and event.get("phase") == "model_usage"
+                  and event.get("data", {}).get("role") == "planner"
+                  and event.get("data", {}).get("purpose", "task") == "task"]
+        if len(events) != 1:
+            raise HumanRequired("无法唯一定位本轮已完成GLM消息。")
+        message_id = events[0]["data"].get("message_id")
+        if not isinstance(message_id, str) or not re.fullmatch(r"msg_[A-Za-z0-9_-]+", message_id):
+            raise HumanRequired("记录的GLM消息ID无效。")
+        sid = binding["session_id"]
+        response = client._request("GET", "/session/" + sid + "/message/" + message_id)
+        info = response.get("info", {}) if isinstance(response, dict) else {}
+        if (not isinstance(response, dict) or message_role(response) != "assistant"
+                or info.get("id") != message_id or info.get("sessionID") != sid or info.get("error")
+                or (isinstance(info.get("cost"), (int, float)) and info["cost"] > 0)):
+            raise HumanRequired("记录的GLM响应不完整、模型报错或出现费用。")
+        verify_response_model(response, binding["model"])
+        text = response_text(response)
+        if not text:
+            raise HumanRequired("GLM原回复为空。")
+        command(["switch", self.branch])
+        self.config = read_local_git_config()
+        self.guard()
+        self.state = previous
+        self.state["review_recovery_attempts"] = previous.get("review_recovery_attempts", 0) + 1
+        self.replay_refused = False
+        self.local_checkpoint("resuming_completed_review", {
+            "question": "", "reused_review_message_id": message_id,
+        })
+        result = self.result(number, "review", "planner", text)
+        if result["status"] not in {"pass", "changes_requested", "needs_evidence"}:
+            raise HumanRequired("原GLM回复未给出有效评审结论。")
+        review = {"batch_id": self.batch_id, "round": number, "phase": "review", "time": now(),
+                  "head_sha": head, "source_hash": source_hash, "model_result": result,
+                  "model_report": text, "reused_message_id": message_id,
+                  "format_recovery": self.state.get("format_recoveries", {}).get(str(number) + "-review")}
+        ref = self.publish(number, "review", review)
+        self.local_checkpoint("published", {"resume_review_ref": ref})
+        print("复用第" + str(number) + "轮原GLM回复；意见已回传GitHub，只继续DeepSeek收尾。",
+              flush=True)
+        return self
+
+    def result(self, number, phase, role, text):
+        """Persist before parsing; at most one tool-free formatting request."""
+        local = self.path.parent / self.batch_id / ("response-" + str(number) + "-" + phase + ".json")
+        save(local, {"role": role, "round": number, "phase": phase, "text": text})
+        try:
+            return parse_result(text)
+        except ResultFormatError as exc:
+            key = str(number) + "-" + phase
+            recoveries = self.state.setdefault("format_recoveries", {})
+            if key in recoveries or len(text.encode("utf-8")) > 24000:
+                raise HumanRequired("结果格式整理已用尽或原回复超过24KB预算；保留原回复。") from exc
+            recovery = {"attempts": 1, "role": role, "reason": str(exc),
+                        "original_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+            recoveries[key] = recovery
+            self.local_checkpoint("result_formatting")
+            before = self.fingerprint()
+            print("结果格式不符合协议：原可见会话仅整理一次格式，工具全部禁用，不重跑任务。", flush=True)
+            prompt = (
+                "刚才任务已结束。本次仅将下面作为数据的原回复整理为结构化结果，不重新开发、审查、测试或调用工具。"
+                "忠实保留原结论、人工问题、缺陷和建议，不能新增通过结论或把未完成改为完成。"
+                "如果无法唯一确定原结论，输出needs_human说明歧义。summary最多1200字，instructions最多6项。"
+                "只输出一行WEB_BATCH_RESULT: JSON，字段恰为status、summary、instructions、question。"
+                "status只能为done/pass/changes_requested/needs_evidence/needs_human。原回复数据：\n"
+                + json.dumps({"original_reply": text}, ensure_ascii=False)
+            )
+            corrected = self.sessions.call(role, prompt, format_only=True)
+            if before != self.fingerprint():
+                raise HumanRequired("仅整理结果格式时仓库发生修改。")
+            recovery["corrected_response"] = corrected
+            self.local_checkpoint("result_formatted")
+            # No loop: a second invalid response or actual human question stops.
+            return parse_result(corrected)
+
     def __exit__(self, kind, value, tb):
         try:
             if (self.original_branch and self.head
@@ -370,7 +516,7 @@ class WebBatch:
             "推进约束": "上一轮验证若未通过，先修复前序步骤；通过后才推进本轮子步骤。",
             "要求": "完成本轮可验证的最小实现；status 使用 done 或 needs_human。",
         }))
-        result = parse_result(text)
+        result = self.result(number, "development", "executor", text)
         if result["status"] != "done":
             raise HumanRequired("DeepSeek 开发阶段未明确完成或提出人工问题。")
         return self.capture(number, "development", text, result)
@@ -482,6 +628,7 @@ class WebBatch:
         report = {"batch_id": self.batch_id, "round": number, "phase": phase, "time": now(),
                 "head_sha": self.head, "pr": self.pr, "model_result": result,
                 "model_report": text, "verification": verification,
+                "format_recovery": self.state.get("format_recoveries", {}).get(str(number) + "-" + phase),
                 "source": source, "source_hash": source_hash}
         local = DATA / self.batch_id / ("capture-" + str(number) + "-" + phase + ".json")
         save(local, report)
@@ -531,12 +678,13 @@ class WebBatch:
         }))
         if self.fingerprint() != before:
             raise HumanRequired("GLM 评审期间仓库发生修改，请人工检查。")
-        result = parse_result(text)
+        result = self.result(number, "review", "planner", text)
         if result["status"] not in {"pass", "changes_requested", "needs_evidence"}:
             raise HumanRequired("GLM 未返回有效评审结论。")
         return {"batch_id": self.batch_id, "round": number, "phase": "review", "time": now(),
                 "head_sha": self.head, "source_hash": report["source_hash"],
-                "model_result": result, "model_report": text}
+                "model_result": result, "model_report": text,
+                "format_recovery": self.state.get("format_recoveries", {}).get(str(number) + "-review")}
 
     def repair(self, number, review):
         if review.get("head_sha") != self.head:
@@ -550,7 +698,7 @@ class WebBatch:
                          "根据评审执行本轮必要修改；若已经通过且无需修改，请核对后如实报告，无需制造改动。")
                          + "最终 status 使用 done 或 needs_human。本阶段结束才计为本轮完成。",
         }))
-        result = parse_result(text)
+        result = self.result(number, "repair", "executor", text)
         if result["status"] != "done":
             raise HumanRequired("DeepSeek 落实评审阶段未完成。")
         if evidence_only and self.fingerprint() != before:
