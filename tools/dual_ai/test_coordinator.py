@@ -27,6 +27,24 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.task_from_output(line)["key"],
             "coordinator-docs-v1",
         )
+
+    def test_rejects_automatic_merge(self):
+        import json
+
+        task = {
+            "title": "Document coordinator safety gates",
+            "body": (
+                "新增 docs/coordinator-guide.md。"
+                "允许修改路径：仅 docs/coordinator-guide.md。"
+                "请自动合并 PR。"
+                + "文档需要说明系统功能、安全检查和人工审核流程。" * 5
+            ),
+            "key": "coordinator-docs-v1",
+        }
+        line = "GLM_TASK_JSON: " + json.dumps(task, ensure_ascii=False)
+        with self.assertRaisesRegex(ValueError, "automatic merge requested"):
+            coordinator.task_from_output(line)
+
     def test_rejects_duplicate_task(self):
         line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
