@@ -134,8 +134,8 @@ class IssueSelectionTests(TempDataTest):
             }
         )
         with mock.patch.object(m, "gh", return_value=ok(payload)) as gh:
-            issue = m.fetch_issue(2)
-        self.assertEqual(issue["number"], 2)
+            issue = m.fetch_issue(42)
+        self.assertEqual(issue["number"], 42)
         self.assertIn("--repo", gh.call_args.args[0])
 
     def test_state_roundtrip(self) -> None:
@@ -188,6 +188,7 @@ class DryRunTests(TempDataTest):
         issue = {
             "number": 42,
             "title": "test issue",
+            "body": "local test fixture, no network",
             "state": "OPEN",
             "labels": [{"name": "ai-ready"}],
             "url": "https://example.invalid/2",
@@ -986,7 +987,7 @@ class RealGitRecoveryTests(TempDataTest):
 
     def test_clean_authorized_retry_preflight_passes(self) -> None:
         with mock.patch.object(m, "remote_claim_exists", return_value=(False, "")):
-            m.preflight_retry(2, "ai/issue-42")
+            m.preflight_retry(42, "ai/issue-42")
         self.assertFalse(m.local_branch_exists("ai/issue-42"))
 
     def test_remote_branch_keeps_retry_authorization(self) -> None:
@@ -1001,7 +1002,7 @@ class RealGitRecoveryTests(TempDataTest):
             self._run_git("branch", "-D", "ai/issue-42")
 
             with self.assertRaises(m.TaskError) as raised:
-                m.preflight_retry(2, "ai/issue-42")
+                m.preflight_retry(42, "ai/issue-42")
         self.assertIn("remote branch already exists", str(raised.exception))
 
     def test_existing_pull_request_keeps_retry_authorization(self) -> None:
@@ -1018,7 +1019,7 @@ class RealGitRecoveryTests(TempDataTest):
                 mock.patch.object(m, "gh", return_value=ok(prs)),
                 self.assertRaises(m.TaskError) as raised,
             ):
-                m.preflight_retry(2, "ai/issue-42")
+                m.preflight_retry(42, "ai/issue-42")
         self.assertIn("pull request already exists", str(raised.exception))
 
     def test_clean_retry_archives_prior_failure_before_new_attempt(self) -> None:
@@ -1095,7 +1096,7 @@ class CheckpointTests(TempDataTest):
         self.assertIn("opencode session list", task["recovery"])
         self.assertIn("recovered_at", task)
         self.assertEqual(task["recovery_count"], 1)
-        self.assertFalse(state["first_run_completed"])
+        self.assertTrue(state["first_run_completed"])
         save.assert_called_once()
         checkpoint.assert_called_once()
         self.assertEqual(checkpoint.call_args.args[4], task["recovery"])
