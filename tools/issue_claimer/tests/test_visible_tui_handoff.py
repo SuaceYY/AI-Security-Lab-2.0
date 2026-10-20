@@ -2,6 +2,7 @@
 import unittest
 from unittest.mock import patch
 
+from tools.dual_ai.visible_tui import VisiblePromptTimeout
 from tools.dual_ai.tui_transport import TUITransportError
 from tools.issue_claimer import claimer
 
@@ -54,7 +55,16 @@ class VisibleTUIHandoffTests(unittest.TestCase):
                 claimer.run_opencode(issue, 1, "", 120)
         run.assert_called_once()
 
+    def test_visible_response_timeout_is_classified_as_task_timeout(self):
+        issue = {"number": 18, "title": "Visible task", "body": "bounded task"}
+        with (
+            patch.object(claimer, "load_binding", return_value={"session_id": "ses_executor"}),
+            patch.object(claimer, "run_prompt", side_effect=VisiblePromptTimeout("request timed out")) as run,
+        ):
+            with self.assertRaises(claimer.TaskTimeout):
+                claimer.run_opencode(issue, 1, "", 120)
+        run.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
-
