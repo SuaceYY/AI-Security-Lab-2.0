@@ -1129,7 +1129,16 @@ def run_opencode(
     agent = os.environ.get("ISSUE_CLAIMER_OPENCODE_AGENT", "").strip()
     if agent:
         command.extend(["--agent", agent])
-    command.append(build_prompt(issue, attempt, previous_error))
+    if session_id:
+        # Resume only the known session; resending the full Issue wastes context.
+        command.append(
+            "继续当前已授权任务。先简要整理本会话已有进度及剩余步骤，"
+            "只完成尚未完成的最小修改。遵守原有文件范围与安全限制，"
+            "不要执行 git add/commit/push、不要创建或合并 PR。"
+            "若无法安全继续，请明确说明并停止。使用简体中文回复。"
+        )
+    else:
+        command.append(build_prompt(issue, attempt, previous_error))
 
     logging.getLogger("issue_claimer").info(
         "starting OpenCode attempt %s/%s for issue #%s", attempt, MAX_ATTEMPTS, number
