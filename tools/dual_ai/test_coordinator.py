@@ -9,18 +9,29 @@ from tools.dual_ai import coordinator
 
 class CoordinatorTests(unittest.TestCase):
     def test_valid_task(self):
-        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
+        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         self.assertEqual(coordinator.task_from_output(line)["key"], "coordinator-docs-v1")
 
     def test_rejects_duplicate_task(self):
-        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
+        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
             coordinator.task_from_output(line + "\n" + line)
 
     def test_rejects_extra_fields(self):
-        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('文档验收要求。' * 20) + '","key":"coordinator-docs-v1","command":"rm -rf ."}'
+        line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1","command":"rm -rf ."}'
         with self.assertRaises(ValueError):
             coordinator.task_from_output(line)
+
+    @patch.object(coordinator, "gh_json", return_value=[
+        {"number": 25, "body": "Closes #42", "mergedAt": "2026-10-20T00:00:00Z"}
+    ])
+    @patch.object(coordinator, "review_new_pr")
+    @patch.object(coordinator, "create_next_issue")
+    @patch.object(coordinator, "load_state", return_value={"created": [42]})
+    def test_human_merge_unlocks_next_issue(self, load, create, review, github):
+        coordinator.tick(write=False)
+        create.assert_called_once()
+        review.assert_not_called()
 
     def test_state_round_trip(self):
         with tempfile.TemporaryDirectory() as folder:
