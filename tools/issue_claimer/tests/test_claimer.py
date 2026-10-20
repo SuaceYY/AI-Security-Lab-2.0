@@ -278,7 +278,8 @@ class StagingTests(TempDataTest):
     def test_staged_secret_patterns_are_rejected(self) -> None:
         diffs = (
             f"diff --git a/config.txt b/config.txt\n+token=ghp_{'a' * 36}\n",
-            "diff --git a/key.pem b/key.pem\n+-----BEGIN RSA PRIVATE KEY-----\n",
+            "diff --git a/key.pem b/key.pem\n+-----BEGIN "
+            "RSA PRIVATE KEY-----\n",
         )
         for diff in diffs:
             with self.subTest(diff=diff.splitlines()[0]):
