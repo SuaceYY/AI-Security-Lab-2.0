@@ -197,7 +197,7 @@ def tick(*, write: bool) -> None:
     if not isinstance(merged, list):
         raise RuntimeError("invalid merged PR list")
     linked = [pr for pr in merged if re.search(
-        rf"(?i)(?:closes|fixes|resolves)\\s+#{latest_issue}\\b",
+        rf"(?i)(?:closes|fixes|resolves)\s+#{latest_issue}\b",
         str(pr.get("body") or ""))]
     if linked:
         if len(state["created"]) >= MAX_TASKS:
