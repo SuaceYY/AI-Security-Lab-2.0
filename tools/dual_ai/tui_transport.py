@@ -19,6 +19,26 @@ class TUITransportError(RuntimeError):
     """The visible TUI could not safely accept or confirm a prompt."""
 
 
+class TUIRequestTimeout(TUITransportError):
+    """An OpenCode request timed out; POST delivery may be ambiguous."""
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        for nested in (getattr(current, "reason", None), getattr(current, "__cause__", None)):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
 class TUIClient:
     def __init__(self, base_url: str, project_dir: Path, *, timeout: float = 5.0):
         parsed = urlsplit(base_url)
@@ -55,6 +75,10 @@ class TUIClient:
             with self.opener.open(request, timeout=self.timeout if timeout is None else timeout) as response:
                 raw = response.read()
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            if _is_timeout_error(exc):
+                raise TUIRequestTimeout(
+                    f"OpenCode request timed out; delivery may be ambiguous ({type(exc).__name__})"
+                ) from exc
             raise TUITransportError(f"OpenCode TUI request failed: {type(exc).__name__}") from exc
         if not raw:
             return None
@@ -156,4 +180,3 @@ class TUIClient:
         if not isinstance(info, dict) or info.get("sessionID") != session_id:
             raise TUITransportError("OpenCode response does not match the bound session")
         return result
-
