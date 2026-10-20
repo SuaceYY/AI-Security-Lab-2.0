@@ -275,6 +275,37 @@ class StagingTests(TempDataTest):
             with self.subTest(path=path), self.assertRaises(m.TaskError):
                 m.check_sensitive_paths([path])
 
+    def test_staged_secret_patterns_are_rejected(self) -> None:
+        diffs = (
+            f"diff --git a/config.txt b/config.txt\n+token=ghp_{'a' * 36}\n",
+            "diff --git a/key.pem b/key.pem\n+-----BEGIN RSA PRIVATE KEY-----\n",
+        )
+        for diff in diffs:
+            with self.subTest(diff=diff.splitlines()[0]):
+                with mock.patch.object(m, "git", return_value=ok(diff)):
+                    with self.assertRaises(m.TaskError):
+                        m.check_staged_secrets()
+
+    def test_staged_byte_limit_boundary(self) -> None:
+        for size, allowed in (
+            (m.MAX_STAGED_BYTES, True),
+            (m.MAX_STAGED_BYTES + 1, False),
+        ):
+            with self.subTest(size=size):
+                root = Path(tempfile.mkdtemp(dir=m.PROJECT_ROOT))
+                self.addCleanup(
+                    lambda root=root: shutil.rmtree(root, ignore_errors=True)
+                )
+                candidate = root / "limit.bin"
+                with candidate.open("wb") as handle:
+                    handle.truncate(size)
+                relative = candidate.relative_to(m.PROJECT_ROOT).as_posix()
+                if allowed:
+                    m.validate_task_paths([relative])
+                else:
+                    with self.assertRaises(m.TaskError):
+                        m.validate_task_paths([relative])
+
     def test_symlink_file_is_rejected_before_resolution(self) -> None:
         root = Path(tempfile.mkdtemp(dir=m.PROJECT_ROOT))
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
@@ -448,6 +479,24 @@ class RepositoryStateTests(TempDataTest):
                     "https://github.com/SuaceYY/AI-Security-Lab-2.0.git",
                     "user.name=Test\n",
                 )
+
+    def test_head_mismatch_is_rejected(self) -> None:
+        def fake_git(args: list[str], timeout: int = 120) -> m.CommandResult:
+            if args == ["branch", "--show-current"]:
+                return ok("ai/issue-2\n")
+            if args == ["rev-parse", "HEAD"]:
+                return ok("other-sha\n")
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(m, "git", side_effect=fake_git):
+            with self.assertRaises(m.TaskError) as raised:
+                m.ensure_task_repository_state(
+                    "ai/issue-2",
+                    "base-sha",
+                    "https://github.com/SuaceYY/AI-Security-Lab-2.0.git",
+                    "user.name=Test\n",
+                )
+        self.assertIn("history", str(raised.exception))
 
     def test_git_config_change_is_rejected(self) -> None:
         def fake_git(args: list[str], timeout: int = 120) -> m.CommandResult:
