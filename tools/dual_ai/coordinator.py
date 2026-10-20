@@ -208,7 +208,7 @@ def tick(*, write: bool) -> None:
                       "--json", "number,body,mergedAt"], root=ROOT)
     if not isinstance(merged, list):
         raise RuntimeError("invalid merged PR list")
-          linked = [
+    linked = [
         pr for pr in merged
         if linked_to_issue(str(pr.get("body") or ""), latest_issue)
     ]
