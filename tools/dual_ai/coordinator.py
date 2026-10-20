@@ -76,11 +76,12 @@ def task_from_output(output: str) -> dict:
 
 
 def linked_to_issue(body: str, issue: int) -> bool:
-    """Recognize both GitHub closing keywords and the existing Worker's PR body."""
+    """Recognize GitHub closing keywords and the Worker's PR body."""
     if not isinstance(body, str) or not isinstance(issue, int) or issue < 1:
         return False
+
     return bool(re.search(
-        rf"(?i)(?:(?:closes|fixes|resolves)\\s+#|automated implementation for issue\\s+#){issue}\\b",
+        rf"(?i)(?:(?:closes|fixes|resolves)\s+#|automated implementation for issue\s+#){issue}\b",
         body,
     ))
 
