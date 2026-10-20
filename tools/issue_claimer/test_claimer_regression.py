@@ -61,3 +61,24 @@ class ClaimerRegressionTests(TestCase):
         self.assertNotIn("SENSITIVE_UNIQUE_LONG_ISSUE_BODY", command[-1])
         self.assertIn("继续当前已授权任务", command[-1])
         self.assertNotIn("--auto", command)
+
+    def test_explicit_issue_scope_rejects_unrelated_workflow(self):
+        issue = {"body": "仅允许新增 `docs/automation-e2e-smoke.md`，不要修改其他文件"}
+        with self.assertRaises(claimer.TaskError):
+            claimer.enforce_issue_file_scope(issue, [".github/workflows/frontend-ci.yml"])
+
+    def test_explicit_issue_scope_accepts_only_new_document(self):
+        issue = {"body": "仅允许新增 `docs/automation-e2e-smoke.md`"}
+        with mock.patch.object(claimer, "git", return_value=claimer.CommandResult(0, "?? docs/automation-e2e-smoke.md\\n", "")):
+            claimer.enforce_issue_file_scope(issue, ["docs/automation-e2e-smoke.md"])
+
+    def test_explicit_issue_scope_rejects_modified_existing_document(self):
+        issue = {"body": "仅允许新增 `docs/automation-e2e-smoke.md`"}
+        with mock.patch.object(claimer, "git", return_value=claimer.CommandResult(0, " M docs/automation-e2e-smoke.md\\n", "")):
+            with self.assertRaises(claimer.TaskError):
+                claimer.enforce_issue_file_scope(issue, ["docs/automation-e2e-smoke.md"])
+
+    def test_documentation_is_a_fixed_verification_category(self):
+        self.assertEqual(claimer.classify_changed_path("docs/automation-e2e-smoke.md"), "docs")
+        with self.assertRaises(claimer.TaskError):
+            claimer.classify_changed_path("docs/nested/unapproved.md")
