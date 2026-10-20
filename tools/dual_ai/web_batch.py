@@ -111,6 +111,7 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--write", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--check", action="store_true", help="read-only TUI compatibility check; no AI call")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", args.batch_id):
         parser.error("batch-id must be 5..64 lowercase letters/digits/hyphens")
@@ -118,6 +119,16 @@ def main(argv=None) -> int:
     if args.status:
         print(WebBatch.status(args.batch_id))
         return 0
+    if args.check:
+        try:
+            from tools.dual_ai.web_context import VisibleWebSessions
+            from tools.dual_ai.web_batch_runtime import ROOT
+            checked = VisibleWebSessions(ROOT, lambda *args: None).check()
+            print(json.dumps(checked, ensure_ascii=False, indent=2), flush=True)
+            return 0
+        except Exception as exc:
+            print("会话兼容性检查未通过：" + str(exc), flush=True)
+            return 2
     if not args.write:
         parser.error("use --write to start one explicitly authorized three-cycle batch")
     plan = validate_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))

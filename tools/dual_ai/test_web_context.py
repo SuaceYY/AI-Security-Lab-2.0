@@ -1,5 +1,6 @@
 """Bound visible session checks; all clients are fake, no actual AI requests."""
 import unittest
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -113,6 +114,33 @@ class VisibleContextTests(unittest.TestCase):
         self.session(client).call("planner", "review")
         body = next(b for _, p, b in client.calls if p.endswith("/message"))
         self.assertEqual(body["tools"], {"read": True, "bash": False, "edit": False, "custom": False})
+
+    def test_read_only_compatibility_check_calls_neither_model_nor_summary(self):
+        client = Client()
+        checked = self.session(client).check()
+        self.assertEqual(set(checked), {"planner", "executor"})
+        self.assertTrue(all(method == "GET" for method, _, _ in client.calls))
+
+    def test_monitor_failure_aborts_exact_request_without_retry(self):
+        client = Client()
+        original = client._request
+        released = threading.Event()
+        def request(method, path, body=None, timeout=None):
+            if path.endswith("/message"):
+                client.calls.append((method, path, body))
+                released.wait(3)
+                return client.response
+            if path.endswith("/abort"):
+                released.set()
+            return original(method, path, body, timeout)
+        client._request = request
+        session = self.session(client)
+        with patch.object(session, "pending", side_effect=RuntimeError("monitor disconnected")):
+            with self.assertRaisesRegex(RuntimeError, "monitor disconnected"):
+                session.request(client, "ses_ds", "/session/ses_ds/message", {}, timeout=2)
+        posts = [p for method, p, _ in client.calls if method == "POST"]
+        self.assertEqual(posts, ["/session/ses_ds/message", "/session/ses_ds/abort"])
+        self.assertTrue(released.is_set())
 
 
 if __name__ == "__main__":

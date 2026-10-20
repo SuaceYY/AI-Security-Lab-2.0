@@ -28,6 +28,7 @@ tools/dual_ai/web_batch_plan.json 是本批已批准范围：静态规则与 Fin
 ```powershell
 python -m unittest discover -s tools/dual_ai -p "test_*.py" -v
 python -m unittest discover -s tools/issue_claimer/tests -p "test_*.py" -v
+python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --check
 python -m tools.dual_ai.web_batch --plan tools/dual_ai/web_batch_plan.json --batch-id web-s1-b001 --write
 ```
 

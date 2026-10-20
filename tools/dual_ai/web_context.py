@@ -59,6 +59,22 @@ class VisibleWebSessions:
             requests.extend(x for x in data if isinstance(x, dict) and x.get("sessionID") == session_id)
         return requests
 
+    def check(self):
+        """Read-only API compatibility check; no model request or compaction."""
+        checked = {}
+        for role in ("planner", "executor"):
+            client, binding = self.client(role)
+            sid = binding["session_id"]
+            if not isinstance(binding.get("model"), str) or "/" not in binding["model"]:
+                raise HumanRequired(role + " 未绑定有效模型。")
+            if client.get_session_status(sid) != "idle" or self.pending(client, sid):
+                raise HumanRequired(role + " 会话未空闲或有人工问题。")
+            tools = client._request("GET", "/experimental/tool/ids")
+            if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
+                raise HumanRequired("无法核对 OpenCode 工具 API。")
+            checked[role] = {"session_id": sid, "model": binding["model"], "ready": True}
+        return checked
+
     def prepare(self, role, prompt):
         client, b = self.client(role)
         sid = b["session_id"]
