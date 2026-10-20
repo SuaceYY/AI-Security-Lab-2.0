@@ -303,6 +303,7 @@ def git(args: list[str], timeout: int = 120) -> CommandResult:
             "--literal-pathspecs",
             *args,
         ],
+        cwd=PROJECT_ROOT,
         timeout=timeout,
     )
 
@@ -771,6 +772,32 @@ def ensure_clean_worktree() -> None:
             "working tree is not clean; refusing to create a task branch: "
             + ", ".join(changed[:10])
         )
+
+
+def local_branch_exists(branch: str) -> bool:
+    result = git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+    if result.timed_out:
+        raise TaskError(f"timed out while checking local branch: {branch}")
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise TaskError(
+        f"cannot inspect local branch {branch}: {trim(result.stderr or result.stdout)}"
+    )
+
+
+def preflight_retry(number: int, branch: str) -> None:
+    ensure_clean_worktree()
+    if local_branch_exists(branch):
+        raise TaskError(
+            f"local task branch already exists: {branch}; "
+            "remove or rename it manually because this tool never deletes or "
+            "force-resets branches"
+        )
+    exists, detail = remote_claim_exists(number)
+    if exists:
+        raise TaskError(detail)
 
 
 def check_sensitive_paths(paths: list[str]) -> None:
@@ -1334,6 +1361,42 @@ def process_issue(issue: dict[str, Any]) -> None:
 
     previous = state["tasks"].get(str(number))
     if previous is not None:
+        try:
+            preflight_retry(number, branch)
+        except Exception as exc:
+            reason = trim(str(exc))
+            previous["preflight_failure"] = reason
+            previous["preflight_failed_at"] = utc_now()
+            previous["next_step"] = (
+                "retry authorization retained; resolve the preflight failure "
+                f"and rerun the worker: {reason}"
+            )
+            previous.setdefault("preflight_history", []).append(
+                {
+                    "checked_at": utc_now(),
+                    "result": "failed",
+                    "branch": branch,
+                    "reason": reason,
+                }
+            )
+            touch_task(previous)
+            save_state(state)
+            write_checkpoint(
+                previous,
+                previous.get("stage") or RECOVERY_REQUIRED_STAGE,
+                previous["next_step"],
+                previous.get("tests", "unknown"),
+                previous.get("recovery", ""),
+            )
+            logger.error(
+                "retry preflight failed for issue #%s; authorization retained: %s",
+                number,
+                reason,
+            )
+            raise StopWorker(
+                f"task #{number} retry preflight failed; authorization retained"
+            ) from exc
+
         state.setdefault("recovery_history", []).append(
             {
                 "issue_number": number,
@@ -1704,6 +1767,10 @@ def manual_recover(
             print(f"  failure: {task.get('failure_reason') or '(none)'}")
             if action == "retry":
                 print("  result: authorize one explicit retry of this issue")
+                print(
+                    "  preflight: deferred to the worker; a dirty worktree, "
+                    "existing branch, or open PR leaves authorization intact"
+                )
             else:
                 print("  result: close this task without deleting its record")
             print("use --confirm to apply this recovery")
@@ -1717,7 +1784,8 @@ def manual_recover(
             task["status"] = RETRY_AUTHORIZED_STATUS
             task["stage"] = MANUAL_RETRY_STAGE
             task["next_step"] = (
-                "explicit retry authorized; the next worker run may claim this issue"
+                "explicit retry authorized; the worker must pass a non-destructive "
+                "worktree/branch/PR preflight before consuming the authorization"
             )
         else:
             task["status"] = ABANDONED_STATUS
@@ -1743,6 +1811,10 @@ def manual_recover(
         )
         print(f"issue #{number} recovery applied: {action}")
         print(f"  audit entries: {len(state['recovery_history'])}")
+        if action == "retry":
+            print(
+                "  preflight: required before the worker consumes this authorization"
+            )
         print(f"  next step: {task['next_step']}")
         return 0
     finally:
