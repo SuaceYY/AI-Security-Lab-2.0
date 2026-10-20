@@ -45,6 +45,27 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "automatic merge requested"):
             coordinator.task_from_output(line)
 
+    def test_rejects_unsafe_allowed_paths(self):
+        import json
+
+        for path in (
+            "docs/../tools/issue_claimer/unsafe.md",
+            "docs/../../.github/unsafe.md",
+            "docs/unsafe.py",
+        ):
+            with self.subTest(path=path):
+                task = {
+                    "title": "Document coordinator safety gates",
+                    "body": (
+                        f"新增文档。允许修改路径：仅 {path}。"
+                        + "文档需要说明系统功能、安全检查和人工审核流程。" * 5
+                    ),
+                    "key": "coordinator-docs-v1",
+                }
+                line = "GLM_TASK_JSON: " + json.dumps(task, ensure_ascii=False)
+                with self.assertRaisesRegex(ValueError, "invalid allowed docs path"):
+                    coordinator.task_from_output(line)
+
     def test_rejects_duplicate_task(self):
         line = 'GLM_TASK_JSON: {"title":"Document coordinator safety gates","body":"' + ('docs/ 文档验收要求。' * 20) + '","key":"coordinator-docs-v1"}'
         with self.assertRaises(ValueError):
