@@ -4,10 +4,9 @@ from __future__ import annotations
 import json
 import re
 import sys
-import time
 from pathlib import Path
 
-from tools.dual_ai.tui_transport import TUIClient, TUITransportError
+from tools.dual_ai.tui_transport import TUIClient, TUIRequestTimeout, TUITransportError
 
 ROOT = Path(__file__).resolve().parents[2]
 SESSION_FILE = ROOT / "data" / "dual_ai" / "active_visible_sessions.json"
@@ -104,9 +103,12 @@ def run_prompt(
     # Model and session are explicit; an ambiguous POST is never retried.
     tag = "GLM" if role == "planner" else "DeepSeek"
     print(f"[{tag}] sending prompt to the bound visible TUI session now.", file=output, flush=True)
-    response = client.send_session_message(
-        session_id, prompt, str(binding.get("model") or ""), timeout=timeout + 5
-    )
+    try:
+        response = client.send_session_message(
+            session_id, prompt, str(binding.get("model") or ""), timeout=timeout + 5
+        )
+    except TUIRequestTimeout as exc:
+        raise VisiblePromptTimeout(str(exc)) from exc
     if message_role(response) != "assistant":
         raise TUITransportError("OpenCode returned a non-assistant response")
     verify_response_model(response, str(binding.get("model") or ""))
@@ -115,4 +117,3 @@ def run_prompt(
         raise TUITransportError("visible session finished without assistant text")
     print(text, file=output, flush=True)
     return text, session_id
-
