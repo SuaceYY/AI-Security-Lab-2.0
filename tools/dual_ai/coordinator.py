@@ -75,6 +75,16 @@ def task_from_output(output: str) -> dict:
     return task
 
 
+def linked_to_issue(body: str, issue: int) -> bool:
+    """Recognize both GitHub closing keywords and the existing Worker's PR body."""
+    if not isinstance(body, str) or not isinstance(issue, int) or issue < 1:
+        return False
+    return bool(re.search(
+        rf"(?i)(?:(?:closes|fixes|resolves)\\s+#|automated implementation for issue\\s+#){issue}\\b",
+        body,
+    ))
+
+
 def roadmap_text(path: Path = ROADMAP) -> str:
     if not path.is_file():
         raise RuntimeError(f"Versioned roadmap missing: {path}. No task will be invented.")
