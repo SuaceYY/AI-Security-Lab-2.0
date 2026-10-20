@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock
 from urllib.parse import urlsplit
 
-from tools.dual_ai.tui_transport import TUIClient, TUITransportError
+from tools.dual_ai.tui_transport import TUIClient, TUIRequestTimeout, TUITransportError
 
 
 class TUITransportTests(unittest.TestCase):
@@ -61,9 +61,20 @@ class TUITransportTests(unittest.TestCase):
         opener = Mock()
         opener.open.side_effect = TimeoutError("ambiguous delivery")
         client.opener = opener
-        with self.assertRaises(TUITransportError):
+        with self.assertRaises(TUIRequestTimeout):
             client.append_prompt("task")
         self.assertEqual(opener.open.call_count, 1)
+
+    def test_url_error_wrapping_timeout_keeps_timeout_type(self):
+        from urllib.error import URLError
+
+        client = TUIClient("http://127.0.0.1:4311", Path.cwd())
+        opener = Mock()
+        opener.open.side_effect = URLError(TimeoutError("server response timed out"))
+        client.opener = opener
+        with self.assertRaises(TUIRequestTimeout):
+            client.send_session_message("ses_executor", "task", "provider/model")
+        opener.open.assert_called_once()
 
     def test_empty_prompt_is_rejected_before_http(self):
         client = TUIClient("http://127.0.0.1:4311", Path.cwd())
@@ -71,3 +82,18 @@ class TUITransportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.send_prompt("  ")
         client._request.assert_not_called()
+
+    def test_session_message_pins_session_and_model_once(self):
+        client = TUIClient("http://127.0.0.1:4312", Path.cwd())
+        client._request = Mock(return_value={"info": {"sessionID": "ses_executor"}})
+        result = client.send_session_message(
+            "ses_executor", "authorized task", "opencode/deepseek-v4.1-flash-free", timeout=905
+        )
+        self.assertEqual(result["info"]["sessionID"], "ses_executor")
+        args, kwargs = client._request.call_args
+        self.assertEqual(args[:2], ("POST", "/session/ses_executor/message"))
+        self.assertEqual(args[2]["model"], {
+            "providerID": "opencode", "modelID": "deepseek-v4.1-flash-free"
+        })
+        self.assertEqual(args[2]["parts"], [{"type": "text", "text": "authorized task"}])
+        self.assertEqual(kwargs["timeout"], 905)
