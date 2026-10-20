@@ -1,0 +1,29 @@
+name: Dual AI Python CI
+
+on:
+  pull_request:
+    branches: [main, feature/dual-ai-github-loop-bootstrap]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/dual-ai-python-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m compileall -q tools
+      - name: Dual AI contract tests without model calls
+        run: python -m unittest discover -s tools/dual_ai -p 'test_*.py' -v
+      - name: Existing worker safety tests
+        run: python -m unittest discover -s tools/issue_claimer/tests -p 'test_*.py' -v
+      - name: Existing worker regression tests
+        run: python -m unittest discover -s tools/issue_claimer -p 'test_claimer_regression.py' -v
