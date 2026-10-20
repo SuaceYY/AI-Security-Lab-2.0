@@ -22,18 +22,31 @@ class ClaimerRegressionTests(TestCase):
         self.assertIn("Simplified Chinese", result)
 
     def test_exact_session_matching(self):
-        output = (
-            "Session ID                         Title\n"
-            "ses_aaa111                          AI issue #9 attempt 1\n"
-            "ses_bbb222                          AI issue #6 attempt 1\n"
-        )
+        import json
+        directory = str(claimer.PROJECT_ROOT)
+        output = json.dumps([
+            {"id": "ses_old111", "title": "AI issue #9 attempt 1", "directory": directory, "created": 1000},
+            {"id": "ses_new222", "title": "AI issue #9 attempt 1", "directory": directory, "created": 2000},
+            {"id": "ses_other333", "title": "AI issue #6 attempt 1", "directory": directory, "created": 2000},
+        ])
         with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, output, "")):
-            self.assertEqual(claimer.find_opencode_session(9, 1), "ses_aaa111")
+            self.assertEqual(claimer.find_opencode_session(9, 1, 1500), "ses_new222")
 
     def test_ambiguous_session_fails_closed(self):
-        output = "ses_aaa111   AI issue #9 attempt 1\nses_bbb222   AI issue #9 attempt 1\n"
+        import json
+        directory = str(claimer.PROJECT_ROOT)
+        output = json.dumps([
+            {"id": "ses_aaa111", "title": "AI issue #9 attempt 1", "directory": directory, "created": 2000},
+            {"id": "ses_bbb222", "title": "AI issue #9 attempt 1", "directory": directory, "created": 2001},
+        ])
         with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, output, "")):
-            self.assertIsNone(claimer.find_opencode_session(9, 1))
+            self.assertIsNone(claimer.find_opencode_session(9, 1, 1500))
+
+    def test_wrong_directory_is_rejected(self):
+        import json
+        output = json.dumps([{"id": "ses_aaa111", "title": "AI issue #9 attempt 1", "directory": "C:/wrong-project", "created": 2000}])
+        with mock.patch.object(claimer, "run_command", return_value=claimer.CommandResult(0, output, "")):
+            self.assertIsNone(claimer.find_opencode_session(9, 1, 1500))
 
     def test_invalid_session_rejected_before_execution(self):
         with self.assertRaises(claimer.TaskError):
