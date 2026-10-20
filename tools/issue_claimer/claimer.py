@@ -857,6 +857,27 @@ def validate_path_components(path: str) -> None:
             raise TaskError(f"planned commit contains a symlink or reparse point: {path}")
 
 
+def enforce_issue_file_scope(issue: dict[str, Any], paths: list[str]) -> None:
+    """Fail closed for an explicit 'only add one file' requirement."""
+    body = str(issue.get("body") or "")
+    match = re.search(
+        r"(?:仅允许新增|只允许新增|仅新增|只新增)\s*[`'\"“”]?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)",
+        body,
+    )
+    if not match:
+        return
+    expected = match.group(1)
+    if expected.startswith("/") or ".." in Path(expected).parts:
+        raise TaskError("unsafe Issue file scope")
+    if paths != [expected]:
+        raise TaskError(
+            f"Issue explicitly restricts changes to {expected}; got {paths!r}"
+        )
+    status = git(["status", "--porcelain=v1", "--", expected])
+    if not status.ok or not status.stdout.startswith("?? "):
+        raise TaskError(f"Issue requires a newly added file: {expected}")
+
+
 def validate_task_paths(paths: list[str]) -> None:
     if not paths:
         raise TaskError("task produced no file changes")
@@ -1218,6 +1239,8 @@ ACTIONS_WORKFLOW_PREFIX = ".github/workflows/"
 
 def classify_changed_path(path: str) -> str:
     normalized = path.replace("\\", "/").strip("/")
+    if normalized.startswith("docs/") and normalized.endswith(".md") and len(Path(normalized).parts) == 2:
+        return "docs"
     if normalized in FRONTEND_FILES or normalized.startswith(FRONTEND_PREFIXES):
         return "frontend"
     if (
@@ -1333,6 +1356,19 @@ def build_verification_plan(
         categories.add(category)
         if category == "actions":
             action_paths.append(PROJECT_ROOT / path)
+
+    if "docs" in categories:
+        for path in changed_paths:
+            if classify_changed_path(path) == "docs":
+                document = PROJECT_ROOT / path
+                if not document.is_file():
+                    return [], f"documentation file is missing: {path}"
+                try:
+                    content = document.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    return [], f"cannot read documentation {path}: {exc}"
+                if not content.strip() or "\\x00" in content:
+                    return [], f"documentation is empty or invalid: {path}"
 
     if "frontend" in categories:
         frontend_root = PROJECT_ROOT / "frontend"
@@ -1563,6 +1599,11 @@ def process_issue(issue: dict[str, Any]) -> None:
                 result = run_opencode(issue, attempt, previous_error, remaining, session_id=session_id)
                 if result.timed_out:
                     raise TaskTimeout("OpenCode session recovery timed out")
+                if result.returncode != 0:
+                    task["next_step"] = "manual review: session recovery failed"
+                    raise StopWorker(
+                        f"OpenCode session recovery failed; inspect {recovery_command(session_id)}"
+                    )
                 if context_exhausted(result):
                     task["next_step"] = "manual review: recovery exhausted"
                     raise StopWorker(f"OpenCode context exhausted after one recovery; inspect {recovery_command(session_id)}")
@@ -1582,6 +1623,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             )
             changed = collect_changed_paths()
             validate_task_paths(changed)
+            enforce_issue_file_scope(issue, changed)
 
             remaining = int(task_deadline - time.monotonic())
             if remaining <= 0:
