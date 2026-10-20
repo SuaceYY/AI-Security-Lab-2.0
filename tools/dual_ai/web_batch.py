@@ -88,13 +88,19 @@ def check_scope(paths: list[str], plan: dict) -> None:
             raise HumanRequired("文件超出本批网页开发范围：" + str(path))
 
 
-def run_batch(bridge, plan: dict) -> dict:
+def run_batch(bridge, plan: dict, *, first_round=1, development_report_ref=None) -> dict:
     """The bridge owns real IO; tests can verify ordering without model calls."""
     validate_plan(plan)
+    if (type(first_round) is not int or not 1 <= first_round <= ROUNDS
+            or (first_round != 1 and development_report_ref is None)):
+        raise HumanRequired("恢复轮次不合法，禁止清零重跑。")
     last = None
-    for number in range(1, ROUNDS + 1):
-        development = bridge.develop(number, plan["round_focus"][number - 1], last)
-        report_ref = bridge.publish(number, "development", development)
+    for number in range(first_round, ROUNDS + 1):
+        if number == first_round and development_report_ref is not None:
+            report_ref = development_report_ref
+        else:
+            development = bridge.develop(number, plan["round_focus"][number - 1], last)
+            report_ref = bridge.publish(number, "development", development)
         published_report = bridge.fetch(report_ref)
         review = bridge.review(number, published_report)
         review_ref = bridge.publish(number, "review", review)
@@ -115,6 +121,7 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--write", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--resume-from-report", type=int, help="explicit recovery from one already-published development report")
     parser.add_argument("--check", action="store_true", help="read-only TUI compatibility check; no AI call")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", args.batch_id):
@@ -136,10 +143,11 @@ def main(argv=None) -> int:
     if not args.write:
         parser.error("use --write to start one explicitly authorized three-cycle batch")
     plan = validate_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))
-    bridge = WebBatch(args.batch_id, plan)
+    bridge = WebBatch(args.batch_id, plan, resume_report_ref=args.resume_from_report)
     try:
         with bridge:
-            result = run_batch(bridge, plan)
+            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if args.resume_from_report else 1,
+                               development_report_ref=args.resume_from_report)
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         print("三轮批次已停止。请联系主审助手核对 GitHub 进度、证据与可行度，再取得下一批启动指令。", flush=True)
         return 0

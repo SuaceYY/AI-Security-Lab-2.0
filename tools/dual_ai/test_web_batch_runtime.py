@@ -1,5 +1,6 @@
 """GitHub handoff and staging boundaries without subprocesses or model calls."""
 import json
+import hashlib
 import base64
 import subprocess
 import tempfile
@@ -155,6 +156,67 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(git("diff", "--cached", "--name-only"), "")
                 self.assertEqual(batch.guard(), [])
                 self.assertEqual(git("rev-parse", "origin/ai/web-web-test-001"), batch.head)
+
+    def prepare_resume(self, root):
+        batch = self.batch(root)
+        batch.resume_report_ref = 99
+        head = "a" * 40
+        previous = dict(batch.state, phase="needs_human", last_phase="development",
+                        last_report_id=99, round=1, rounds_completed=0,
+                        branch=batch.branch, head_sha=head, base_sha="b" * 40,
+                        issue=33, pr=34)
+        batch.path.write_text(json.dumps(previous), encoding="utf-8")
+        source = {"files": {}}
+        report = {"batch_id": batch.batch_id, "round": 1, "phase": "development", "pr": 34,
+                  "head_sha": head, "verification": {"ok": True}, "source": source,
+                  "source_hash": hashlib.sha256(json.dumps(source, sort_keys=True,
+                                                          ensure_ascii=False).encode()).hexdigest()}
+        batch.fetch = Mock(return_value=report)
+        batch.guard = Mock(return_value=[])
+        batch.post = Mock(return_value=100)
+        batch.api = Mock(side_effect=lambda path, *args:
+                         [] if "/comments?" in path else {"state": "open", "head": {"sha": head}})
+        return batch, head
+
+    def test_resume_preserves_counter_and_sends_no_model_request_in_preflight(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head = self.prepare_resume(Path(folder))
+            def command(args):
+                return "feature/web-three-cycle-batch" if args[0] == "branch" else head if args[0] == "rev-parse" else ""
+            with patch(RUNTIME + "ensure_clean_worktree"), \
+                 patch(RUNTIME + "command", side_effect=command), \
+                 patch(RUNTIME + "read_origin_url", return_value="https://github.com/SuaceYY/AI-Security-Lab-2.0"), \
+                 patch(RUNTIME + "read_local_git_config", return_value="config"), \
+                 patch(RUNTIME + "VisibleWebSessions") as sessions:
+                self.assertIs(batch.enter_resume(), batch)
+            self.assertEqual(batch.state["rounds_completed"], 0)
+            self.assertEqual(batch.state["resume_attempts"], 1)
+            sessions.return_value.check.assert_called_once()
+            sessions.return_value.call.assert_not_called()
+            self.assertEqual(batch.state["head_sha"], head)
+
+    def test_resume_after_review_dispatch_is_refused_without_overwriting_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head = self.prepare_resume(Path(folder))
+            original = batch.path.read_text(encoding="utf-8")
+            marker = "<!-- web-batch=" + batch.batch_id + " round=1 phase=review_started -->"
+            batch.api = Mock(return_value=[{"body": marker}])
+            with patch(RUNTIME + "ensure_clean_worktree"), \
+                 patch(RUNTIME + "command", return_value="feature/web-three-cycle-batch"), \
+                 patch(RUNTIME + "read_origin_url", return_value="https://github.com/SuaceYY/AI-Security-Lab-2.0"):
+                with self.assertRaises(HumanRequired):
+                    batch.enter_resume()
+            batch.pause("refused")
+            self.assertEqual(batch.path.read_text(encoding="utf-8"), original)
+            batch.fetch.assert_not_called()
+
+    def test_resume_with_changed_report_or_plan_is_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head = self.prepare_resume(Path(folder))
+            batch.resume_report_ref = 98
+            with self.assertRaises(HumanRequired):
+                batch.enter_resume()
+            batch.api.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -55,3 +55,14 @@ python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --status
 把 Issue/PR 链接或最终 PowerShell/TUI 截图发给主审助手。主审读取最终源码、最后一次整改后的真实验证及 GitHub 交接，说明当前进度、可行度、未完成项与下一步。得到人工合并批准后合并。下一批必须按已合并成果更新计划 revision/三项 focus 和新 batch-id，再给出明确启动代码；不自动在未合并成果上推进新批次。
 
 首次实际运行前仍须验证用户本机 OpenCode 的 permission/question/summarize API 兼容性与可见会话行为；单元测试中的假客户端不是双窗口实测证据。
+
+## 已发布开发报告的受限恢复
+
+报告传输使用独立 Base64 分块及 SHA-256 校验，保留可读 JSON 报告，避免 CLI 的终端控制字符转换破坏嵌套 JSON。解码不会执行报告中的命令，不会猜测修复无效转义。
+
+只有主审已核对的以下暂停点可以恢复：原状态为 needs_human、本轮开发报告已发布且固定验证通过、GLM review_started 尚未登记、Issue/PR/提交/计划和原计数全部一致、两个会话空闲、工作区干净。恢复需显式 --resume-from-report 原开发报告评论ID --write；每批最多一次此类恢复，不重做已完成开发，不创建新 Issue/PR，不清零计数。若投递可能已发生或源码改变，则拒绝恢复并保留原状态。三轮上限不变。
+
+本次 Issue #33 的恢复报告为 6298174688，主审修复并验证交接数据后，才可运行：
+```powershell
+python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --resume-from-report 6298174688 --write
+```

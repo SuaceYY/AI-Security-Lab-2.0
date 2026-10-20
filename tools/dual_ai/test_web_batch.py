@@ -99,6 +99,27 @@ class BatchContractTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(HumanRequired):
                 check_scope([path], PLAN)
 
+    def test_explicit_resume_starts_with_review_of_existing_report(self):
+        bridge = Bridge()
+        bridge.comments["prior"] = {"published": "development", "number": 1}
+        result = run_batch(bridge, PLAN, development_report_ref="prior")
+        self.assertEqual(result["rounds"], 3)
+        self.assertNotIn(("develop", 1), bridge.events)
+        self.assertNotIn(("publish_development", 1), bridge.events)
+        phases = [x for x in bridge.events if x[0] in {"review", "repair", "complete"}]
+        self.assertEqual(phases, [(p, n) for n in (1, 2, 3)
+                                  for p in ("review", "repair", "complete")])
+        self.assertEqual(bridge.events[0], ("fetch", "prior"))
+
+    def test_resume_round_two_keeps_three_as_terminal_count(self):
+        bridge = Bridge()
+        bridge.comments["prior"] = {"published": "development", "number": 2}
+        result = run_batch(bridge, PLAN, first_round=2, development_report_ref="prior")
+        self.assertEqual(result["rounds"], 3)
+        self.assertNotIn(("develop", 1), bridge.events)
+        self.assertNotIn(("develop", 2), bridge.events)
+        self.assertEqual([n for p, n in bridge.events if p == "complete"], [2, 3])
+
 
 class ResultTests(unittest.TestCase):
     def result(self, **changes):
