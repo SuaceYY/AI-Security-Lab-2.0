@@ -165,9 +165,13 @@ def main(argv=None) -> int:
     parser.add_argument("--resume-from-report", type=int, help="explicit recovery from one already-published development report")
     parser.add_argument("--check", action="store_true", help="read-only TUI compatibility check; no AI call")
     parser.add_argument("--resume-completed-review", action="store_true", help="reuse the recorded GLM reply after result-format failure")
+    parser.add_argument("--resume-format-compatibility", action="store_true",
+                        help="one explicit continuation after the recorded tool-free formatter FreeTierError")
     args = parser.parse_args(argv)
-    if args.resume_completed_review and args.resume_from_report is not None:
+    if sum((args.resume_completed_review, args.resume_format_compatibility,
+            args.resume_from_report is not None)) > 1:
         parser.error("choose only one recovery mode")
+    resume_review = args.resume_completed_review or args.resume_format_compatibility
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{4,63}", args.batch_id):
         parser.error("batch-id must be 5..64 lowercase letters/digits/hyphens")
     from tools.dual_ai.web_batch_runtime import WebBatch
@@ -188,12 +192,13 @@ def main(argv=None) -> int:
         parser.error("use --write to start one explicitly authorized three-cycle batch")
     plan = validate_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))
     bridge = WebBatch(args.batch_id, plan, resume_report_ref=args.resume_from_report,
-                      resume_completed_review=args.resume_completed_review)
+                      resume_completed_review=resume_review,
+                      resume_format_compatibility=args.resume_format_compatibility)
     try:
         with bridge:
-            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if (args.resume_from_report or args.resume_completed_review) else 1,
+            result = run_batch(bridge, plan, first_round=bridge.state.get("round", 1) if (args.resume_from_report or resume_review) else 1,
                                development_report_ref=args.resume_from_report,
-                               review_report_ref=bridge.state.get("resume_review_ref") if args.resume_completed_review else None)
+                               review_report_ref=bridge.state.get("resume_review_ref") if resume_review else None)
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         print("三轮批次已停止。请联系主审助手核对 GitHub 进度、证据与可行度，再取得下一批启动指令。", flush=True)
         return 0

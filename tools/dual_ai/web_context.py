@@ -143,7 +143,9 @@ class VisibleWebSessions:
             tool_ids = client._request("GET", "/experimental/tool/ids")
             if not isinstance(tool_ids, list) or any(not isinstance(t, str) for t in tool_ids):
                 raise HumanRequired("无法核对 GLM 只读工具清单。")
-            readonly = set() if format_only else {"read", "glob", "grep", "webfetch"}
+            readonly = {"read", "glob", "grep", "webfetch"}
+            # Preserve the genuine OpenCode read-only review profile. A request
+            # with every built-in tool disabled can be rejected by Zen free tier.
             body["tools"] = {name: name in readonly for name in tool_ids}
         print("[" + ("GLM" if role == "planner" else "DeepSeek") + "] 可见会话：" + sid, flush=True)
         response = self.request(client, sid, "/session/" + sid + "/message", body, timeout=self.timeout)

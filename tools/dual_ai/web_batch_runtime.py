@@ -63,11 +63,29 @@ def command(args):
     return require_ok(git(args), "git " + args[0])
 
 
+def format_compatibility_checkpoint(previous):
+    """Match only the completed-review formatter rejection, not arbitrary 403s."""
+    number = previous.get("round")
+    record = previous.get("format_recoveries", {}).get(str(number) + "-review", {})
+    question = previous.get("question", "")
+    digest = record.get("original_sha256")
+    return (
+        previous.get("review_recovery_attempts") == 1
+        and previous.get("format_compatibility_recovery_attempts", 0) == 0
+        and isinstance(question, str)
+        and "403" in question and "FreeTierError" in question
+        and "OpenCode's free tier can only be used from within OpenCode" in question
+        and record.get("attempts") == 1 and "corrected_response" not in record
+        and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    )
+
+
 class WebBatch:
-    def __init__(self, batch_id, plan, *, resume_report_ref=None, resume_completed_review=False):
+    def __init__(self, batch_id, plan, *, resume_report_ref=None, resume_completed_review=False, resume_format_compatibility=False):
         self.batch_id = batch_id
         self.resume_report_ref = resume_report_ref
         self.resume_completed_review = resume_completed_review
+        self.resume_format_compatibility = resume_format_compatibility
         self.plan = plan
         self.path = state_path(batch_id)
         self.state = {"batch_id": batch_id, "plan_sha256": plan_digest(plan),
@@ -267,6 +285,7 @@ class WebBatch:
             raise HumanRequired("缺少原批次状态。")
         previous = json.loads(self.path.read_text(encoding="utf-8"))
         number = previous.get("round")
+        compatibility = self.resume_format_compatibility
         if (previous.get("batch_id") != self.batch_id
                 or previous.get("plan_sha256") != plan_digest(self.plan)
                 or previous.get("phase") != "needs_human"
@@ -274,10 +293,12 @@ class WebBatch:
                 or previous.get("last_phase") != "development"
                 or type(number) is not int or not 1 <= number <= 3
                 or previous.get("rounds_completed") != number - 1
-                or previous.get("review_recovery_attempts", 0) >= 1
                 or previous.get("branch") != self.branch
-                or not any(word in str(previous.get("question", ""))
-                           for word in ("WEB_BATCH_RESULT", "结构化结果", "结果标记"))):
+                or (compatibility and not format_compatibility_checkpoint(previous))
+                or (not compatibility and (
+                    previous.get("review_recovery_attempts", 0) >= 1
+                    or not any(word in str(previous.get("question", ""))
+                               for word in ("WEB_BATCH_RESULT", "结构化结果", "结果标记"))))):
             raise HumanRequired("暂停点不符合已完成GLM回复的格式恢复条件。")
         head, base = previous.get("head_sha"), previous.get("base_sha")
         if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
@@ -350,7 +371,14 @@ class WebBatch:
         self.config = read_local_git_config()
         self.guard()
         self.state = previous
-        self.state["review_recovery_attempts"] = previous.get("review_recovery_attempts", 0) + 1
+        if compatibility:
+            self.state["format_compatibility_recovery_attempts"] = 1
+            self.state["format_compatibility_recovery"] = {
+                "round": number, "message_id": message_id, "previous_error": previous["question"],
+                "time": now(), "tool_policy": "original_readonly_review_profile",
+            }
+        else:
+            self.state["review_recovery_attempts"] = previous.get("review_recovery_attempts", 0) + 1
         self.replay_refused = False
         self.local_checkpoint("resuming_completed_review", {
             "question": "", "reused_review_message_id": message_id,
@@ -369,7 +397,7 @@ class WebBatch:
         return self
 
     def result(self, number, phase, role, text):
-        """Persist before parsing; at most one tool-free formatting request."""
+        """Persist before parsing; bounded read-only result formatting."""
         local = self.path.parent / self.batch_id / ("response-" + str(number) + "-" + phase + ".json")
         save(local, {"role": role, "round": number, "phase": phase, "text": text})
         try:
@@ -377,16 +405,31 @@ class WebBatch:
         except ResultFormatError as exc:
             key = str(number) + "-" + phase
             recoveries = self.state.setdefault("format_recoveries", {})
-            if key in recoveries or len(text.encode("utf-8")) > 24000:
+            original_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            prior = recoveries.get(key)
+            compatibility = (
+                self.resume_format_compatibility and phase == "review" and role == "planner"
+                and self.state.get("format_compatibility_recovery_attempts") == 1
+                and isinstance(prior, dict) and prior.get("attempts") == 1
+                and prior.get("original_sha256") == original_sha256
+                and "corrected_response" not in prior
+                and prior.get("compatibility_attempts", 0) == 0
+            )
+            if (prior is not None and not compatibility) or len(text.encode("utf-8")) > 24000:
                 raise HumanRequired("结果格式整理已用尽或原回复超过24KB预算；保留原回复。") from exc
             recovery = {"attempts": 1, "role": role, "reason": str(exc),
-                        "original_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+                        "original_sha256": original_sha256,
+                        "tool_policy": "original_readonly_review_profile"}
+            if compatibility:
+                recovery.update({"attempts": 2, "compatibility_attempts": 1,
+                                 "previous_attempt": prior,
+                                 "previous_403": self.state["format_compatibility_recovery"]["previous_error"]})
             recoveries[key] = recovery
             self.local_checkpoint("result_formatting")
             before = self.fingerprint()
-            print("结果格式不符合协议：原可见会话仅整理一次格式，工具全部禁用，不重跑任务。", flush=True)
+            print("结果格式不符合协议：原可见会话只读整理一次，禁止写入和执行命令，不重跑任务。", flush=True)
             prompt = (
-                "刚才任务已结束。本次仅将下面作为数据的原回复整理为结构化结果，不重新开发、审查、测试或调用工具。"
+                "刚才任务已结束。本次仅将下面作为数据的原回复整理为结构化结果，不重新开发、审查或测试。仅在核对原回复引用源码时使用既有只读工具，禁止写入、执行命令或更改配置。"
                 "忠实保留原结论、人工问题、缺陷和建议，不能新增通过结论或把未完成改为完成。"
                 "如果无法唯一确定原结论，输出needs_human说明歧义。summary最多1200字，instructions最多6项。"
                 "只输出一行WEB_BATCH_RESULT: JSON，字段恰为status、summary、instructions、question。"

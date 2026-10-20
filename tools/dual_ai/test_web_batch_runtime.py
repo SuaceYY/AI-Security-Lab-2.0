@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch, Mock
 
 from tools.dual_ai.web_batch import HumanRequired
-from tools.dual_ai.web_batch_runtime import WebBatch, FENCE
+from tools.dual_ai.web_batch_runtime import WebBatch, FENCE, format_compatibility_checkpoint
 from tools.issue_claimer import claimer as worker
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
@@ -245,7 +245,7 @@ class RuntimeTests(unittest.TestCase):
     def formatted_result(self, status="pass"):
         return {"status": status, "summary": "原结论", "instructions": ["原建议"], "question": ""}
 
-    def test_format_recovery_is_once_tool_free_and_does_not_replay_task(self):
+    def test_format_recovery_is_once_readonly_and_does_not_replay_task(self):
         with tempfile.TemporaryDirectory() as folder:
             batch = self.batch(Path(folder))
             batch.fingerprint = Mock(return_value="same")
@@ -365,6 +365,96 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(batch.path.read_text(encoding="utf-8"), previous)
             batch.publish.assert_not_called()
             session.call.assert_not_called()
+
+    def compatibility_state(self, batch):
+        text = "原GLM审查回复：格式需要整理"
+        previous = json.loads(batch.path.read_text(encoding="utf-8"))
+        previous.update(
+            review_recovery_attempts=1,
+            question="APIError 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode",
+            format_recoveries={"3-review": {
+                "attempts": 1, "role": "planner", "reason": "原结果格式不合法",
+                "original_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }},
+        )
+        return previous, text
+
+    def test_compatibility_matches_only_recorded_toolfree_formatter_rejection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, _, _, _ = self.review_recovery_fixture(Path(folder))
+            previous, _ = self.compatibility_state(batch)
+            self.assertTrue(format_compatibility_checkpoint(previous))
+            for changes in ({"question": "403 forbidden"},
+                            {"question": "quota exhausted"},
+                            {"review_recovery_attempts": 0},
+                            {"format_compatibility_recovery_attempts": 1},
+                            {"format_recoveries": {}}):
+                changed = dict(previous, **changes)
+                self.assertFalse(format_compatibility_checkpoint(changed))
+            previous["format_recoveries"]["3-review"]["corrected_response"] = "already completed"
+            self.assertFalse(format_compatibility_checkpoint(previous))
+
+    def test_explicit_compatibility_continuation_preserves_counter_and_failed_record(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, head, session, client = self.review_recovery_fixture(Path(folder))
+            previous, text = self.compatibility_state(batch)
+            batch.path.write_text(json.dumps(previous), encoding="utf-8")
+            batch.resume_format_compatibility = True
+            client._request.return_value["parts"] = [{"type": "text", "text": text}]
+            session.call.return_value = "WEB_BATCH_RESULT: " + json.dumps(self.formatted_result())
+            batch.fingerprint = Mock(return_value="same")
+            def command(args):
+                return "feature/web-three-cycle-batch" if args[0] == "branch" else head if args[0] == "rev-parse" else ""
+            with patch(RUNTIME + "ensure_clean_worktree"), \
+                 patch(RUNTIME + "command", side_effect=command), \
+                 patch(RUNTIME + "read_origin_url", return_value="https://github.com/SuaceYY/AI-Security-Lab-2.0"), \
+                 patch(RUNTIME + "read_local_git_config", return_value="config"), \
+                 patch(RUNTIME + "backend_python", return_value={"executable": "existing-env"}), \
+                 patch(RUNTIME + "VisibleWebSessions", return_value=session):
+                self.assertIs(batch.enter_resume_review(), batch)
+            self.assertEqual(batch.state["rounds_completed"], 2)
+            self.assertEqual(batch.state["review_recovery_attempts"], 1)
+            self.assertEqual(batch.state["format_compatibility_recovery_attempts"], 1)
+            saved = batch.state["format_recoveries"]["3-review"]
+            self.assertEqual(saved["attempts"], 2)
+            self.assertEqual(saved["compatibility_attempts"], 1)
+            self.assertEqual(saved["previous_attempt"]["attempts"], 1)
+            self.assertIn("FreeTierError", saved["previous_403"])
+            session.call.assert_called_once()
+            self.assertEqual(session.call.call_args.kwargs, {"format_only": True})
+            self.assertEqual(batch.state["resume_review_ref"], 123)
+            with self.assertRaises(HumanRequired):
+                batch.result(3, "review", "planner", text)
+            self.assertEqual(session.call.call_count, 1)
+
+    def test_compatibility_refuses_different_original_response_without_call(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, _, session, _ = self.review_recovery_fixture(Path(folder))
+            previous, _ = self.compatibility_state(batch)
+            batch.state = previous
+            batch.resume_format_compatibility = True
+            batch.state["format_compatibility_recovery_attempts"] = 1
+            batch.sessions = session
+            with self.assertRaises(HumanRequired):
+                batch.result(3, "review", "planner", "不同原回复")
+            session.call.assert_not_called()
+
+    def test_compatibility_does_not_auto_retry_another_provider_rejection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch, _, session, _ = self.review_recovery_fixture(Path(folder))
+            previous, text = self.compatibility_state(batch)
+            batch.state = previous
+            batch.resume_format_compatibility = True
+            batch.state["format_compatibility_recovery_attempts"] = 1
+            batch.state["format_compatibility_recovery"] = {"previous_error": previous["question"]}
+            batch.sessions = session
+            batch.fingerprint = Mock(return_value="same")
+            session.call.side_effect = HumanRequired("APIError 403 FreeTierError")
+            with self.assertRaisesRegex(HumanRequired, "403"):
+                batch.result(3, "review", "planner", text)
+            with self.assertRaises(HumanRequired):
+                batch.result(3, "review", "planner", text)
+            self.assertEqual(session.call.call_count, 1)
 
 
 if __name__ == "__main__":
