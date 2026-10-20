@@ -1275,7 +1275,7 @@ def process_issue(issue: dict[str, Any]) -> None:
     except TaskTimeout as exc:
         task["status"] = "timed_out"
         task["stage"] = "timed_out"
-        task["failure_reason"] = str(exc)
+        task["failure_reason"] = trim(str(exc))
         task["next_step"] = "inspect worktree and resume manually"
         task["updated_at"] = utc_now()
         finalize_first_run(state)
@@ -1287,7 +1287,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["tests"],
             recovery_command(),
         )
-        logger.error("issue #%s timed out: %s", number, exc)
+        logger.error("issue #%s timed out: %s", number, trim(str(exc)))
         raise StopWorker(f"task #{number} timed out") from exc
     except (TaskError, StopWorker) as exc:
         task["status"] = "failed"
@@ -1304,7 +1304,7 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["tests"],
             recovery_command(),
         )
-        logger.error("issue #%s failed: %s", number, exc)
+        logger.error("issue #%s failed: %s", number, trim(str(exc)))
         if isinstance(exc, StopWorker):
             raise
         raise StopWorker(f"task #{number} failed") from exc
@@ -1323,7 +1323,11 @@ def process_issue(issue: dict[str, Any]) -> None:
             task["tests"],
             recovery_command(),
         )
-        logger.exception("issue #%s failed unexpectedly", number)
+        logger.error(
+            "issue #%s failed unexpectedly: %s",
+            number,
+            trim(str(exc)),
+        )
         raise StopWorker(f"task #{number} failed unexpectedly") from exc
 
 
