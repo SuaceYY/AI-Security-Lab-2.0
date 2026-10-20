@@ -40,7 +40,7 @@ class CoordinatorTests(unittest.TestCase):
             ),
             "key": "coordinator-docs-v2",
         }
-        output = "规划说明。\nGLM_TASK_JSON: " + json.dumps(
+        output = "规划说明。\nGLM_TASK_JSON： " + json.dumps(
             task, ensure_ascii=False, indent=2
         )
         parsed = coordinator.task_from_output(output)
@@ -49,6 +49,42 @@ class CoordinatorTests(unittest.TestCase):
             coordinator.declared_docs_path(parsed["body"]),
             "docs/dual-ai-coordinator-guide.md",
         )
+
+    def test_accepts_fullwidth_task_marker_colon(self):
+        import json
+
+        task = {
+            "title": "Document coordinator parsing behavior",
+            "body": (
+                "仅新增 docs/coordinator-parser-note.md。"
+                "验收标准：说明解析行为和人工审核闸门。"
+                "固定验证：仅该文件变更。"
+            ),
+            "key": "coordinator-parser-note",
+        }
+        output = "GLM_TASK_JSON： " + json.dumps(task, ensure_ascii=False, indent=2)
+        self.assertEqual(
+            coordinator.task_from_output(output)["key"],
+            "coordinator-parser-note",
+        )
+
+    def test_existing_task_history_blocks_completed_issue_key_and_path(self):
+        history, keys, paths = coordinator.existing_task_history([
+            {
+                "number": 15,
+                "title": "Docs: dual-AI coordinator guide",
+                "state": "open",
+                "body": (
+                    "<!-- dual-ai-task key=docs-dual-ai-coordinator-guide -->\n\n"
+                    "仅新增 docs/dual-ai-coordinator-guide.md\n\n"
+                    "允许修改路径：仅 docs/dual-ai-coordinator-guide.md"
+                ),
+            },
+            {"number": 20, "title": "Unrelated issue", "state": "closed", "body": ""},
+        ])
+        self.assertIn("#15", history)
+        self.assertIn("docs-dual-ai-coordinator-guide", keys)
+        self.assertIn("docs/dual-ai-coordinator-guide.md", paths)
 
     def test_rejects_multiple_explicit_allowed_paths(self):
         import json
