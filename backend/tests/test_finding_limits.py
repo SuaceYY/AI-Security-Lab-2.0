@@ -14,7 +14,10 @@ import static_scan  # noqa: E402
 from scan_service import (  # noqa: E402
     MAX_FINDINGS,
     MAX_SCAN_RESPONSE_BYTES,
+    ScanSummary,
     ScanValidationError,
+    _json_size,
+    _serialized_response_size,
     run_scan,
 )
 from static_scan import FindingLimitExceeded, scan_text  # noqa: E402
@@ -30,7 +33,16 @@ def source_with_findings(count: int) -> str:
     return FINDING_LINE * count
 
 
-def post_scan(files: list[dict]) -> tuple[int, dict, int]:
+def internal_response_size(payload: dict) -> int:
+    return _serialized_response_size(
+        payload["task_id"],
+        ScanSummary(**payload["summary"]),
+        [_json_size(item) for item in payload["files"]],
+        [_json_size(item) for item in payload["findings"]],
+    )
+
+
+def post_scan_response(files: list[dict]) -> tuple[int, dict, bytes]:
     body = json.dumps({"files": files}).encode("utf-8")
     scope = {
         "type": "http",
@@ -77,13 +89,18 @@ def post_scan(files: list[dict]) -> tuple[int, dict, int]:
     return (
         start["status"],
         json.loads(response_body.decode("utf-8")),
-        len(response_body),
+        response_body,
     )
+
+
+def post_scan(files: list[dict]) -> tuple[int, dict, int]:
+    status, payload, response_body = post_scan_response(files)
+    return status, payload, len(response_body)
 
 
 class FindingLimitTests(unittest.TestCase):
     def test_exactly_1000_findings_across_files_completes(self):
-        status, payload, response_length = post_scan(
+        status, payload, response_body = post_scan_response(
             [
                 scan_file("src/first.py", source_with_findings(600)),
                 scan_file("src/second.py", source_with_findings(400)),
@@ -91,7 +108,8 @@ class FindingLimitTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertLessEqual(response_length, MAX_SCAN_RESPONSE_BYTES)
+        self.assertLessEqual(len(response_body), MAX_SCAN_RESPONSE_BYTES)
+        self.assertEqual(internal_response_size(payload), len(response_body))
         self.assertEqual(payload["status"], "done")
         self.assertEqual(
             payload["summary"],
@@ -168,6 +186,81 @@ class FindingLimitTests(unittest.TestCase):
         long_path = "src/" + "a" * 4096 + ".py"
         status, payload, _ = post_scan(
             [scan_file(long_path, source_with_findings(1000))]
+        )
+
+        self.assertEqual(status, 413)
+        self.assertNotIn("status", payload)
+        self.assertNotIn("findings", payload)
+        self.assertEqual(payload["detail"]["status"], "failed")
+        self.assertEqual(payload["detail"]["code"], "scan_output_too_large")
+
+    def test_multi_file_zero_finding_skipped_and_utf8_round_trip(self):
+        status, payload, response_body = post_scan_response(
+            [
+                scan_file("src/安全/空.py", 'print("安全")\n'),
+                scan_file("src/unsupported.txt", FINDING_LINE),
+                scan_file("node_modules/pkg/util.js", FINDING_LINE),
+                scan_file("src/危险.js", "eval(用户输入)\n"),
+            ]
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(
+            payload["summary"],
+            {
+                "file_count": 4,
+                "scanned_count": 2,
+                "skipped_count": 2,
+                "finding_count": 1,
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    item["file_path"],
+                    item["status"],
+                    item["finding_count"],
+                    item["reason"],
+                )
+                for item in payload["files"]
+            ],
+            [
+                ("src/安全/空.py", "scanned", 0, None),
+                ("src/unsupported.txt", "skipped", 0, "不支持的文件类型"),
+                (
+                    "node_modules/pkg/util.js",
+                    "skipped",
+                    0,
+                    "位于排除目录：node_modules",
+                ),
+                ("src/危险.js", "scanned", 1, None),
+            ],
+        )
+        self.assertEqual(len(payload["findings"]), 1)
+        finding = payload["findings"][0]
+        self.assertEqual(finding["rule_id"], "JS-EVAL")
+        self.assertEqual(finding["file_path"], "src/危险.js")
+        self.assertEqual(finding["evidence"], "eval(用户输入)")
+        self.assertEqual(internal_response_size(payload), len(response_body))
+
+    def test_exactly_2mib_response_succeeds_and_one_more_byte_is_rejected(self):
+        _, _, base_body = post_scan_response([scan_file("src/.py", FINDING_LINE)])
+        padding = (MAX_SCAN_RESPONSE_BYTES - len(base_body)) // 2
+        self.assertEqual(len(base_body) + 2 * padding, MAX_SCAN_RESPONSE_BYTES)
+        path = "src/" + "a" * padding + ".py"
+
+        status, payload, response_body = post_scan_response(
+            [scan_file(path, FINDING_LINE)]
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(len(response_body), MAX_SCAN_RESPONSE_BYTES)
+        self.assertEqual(internal_response_size(payload), len(response_body))
+
+        status, payload, _ = post_scan_response(
+            [scan_file(path, "eval(user_input)#\n")]
         )
 
         self.assertEqual(status, 413)
