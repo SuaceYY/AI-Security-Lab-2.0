@@ -1,26 +1,19 @@
 {
   "schema_version": 1,
-  "revision": 5,
-  "title": "网页阶段一验收：真实浏览器扫描主流程",
-  "roadmap": "沿用已合并的网页文件筛选、静态扫描 API、深层响应校验以及请求/响应资源上限。本批只补真实浏览器中的主流程验收；完成后按原大纲进入本地 AI 集成、独立证据核验、自动报告与稳定性成本控制。",
-  "goal": "在 Windows 已安装的 Microsoft Edge 中使用 Playwright 驱动真实网页，验证选择本地代码文件、前端排除敏感或不支持文件、只提交允许文件、展示统一 Finding 和可读错误的完整用户流程。测试使用浏览器级 API 路由替身以保持确定性，不访问外网、不执行所选代码；仅增加轻量测试依赖，不下载额外浏览器。三轮继续复用现有两个真实 OpenCode TUI，通过 GitHub 交接，第三轮整改后自动停止，人工主审后才合并。",
+  "revision": 6,
+  "title": "网页阶段二起步：本地 AI Finding 优先级分析",
+  "roadmap": "阶段一的本地文件筛选、静态扫描、资源上限与真实 Edge 主流程已经完成。本批只进入阶段二的第一个小切片：让后端把既有 Finding 交给本机 Ollama 做结构化优先级分析。暂不做前端按钮、工具调用、独立证据核验或报告生成；旧 auto_lab.py、evidence_check.py、report_generator.py 不迁移、不修改，后续按大纲分批接入。",
+  "goal": "新增一个可测试、可限流、默认只访问 127.0.0.1:11434 的本地 AI 分析契约。使用 Ollama 官方 /api/chat、stream=false 和 JSON Schema structured output；只发送既有 Finding 的受限字段，不发送源码，不读取用户文件，不执行任何模型建议。模型名从 AI_SECURITY_LAB_OLLAMA_MODEL 读取并提供清晰默认值；HTTP 使用 Python 标准库且支持注入假传输，CI 不启动 Ollama、不访问网络。三轮继续复用两个真实 OpenCode TUI，经 GitHub 完成交接，第三轮整改后停止，人工主审后才合并。",
   "allowed_roots": [
-    "frontend/src/",
-    "frontend/tests/",
     "backend/"
   ],
-  "allowed_files": [
-    "frontend/package.json",
-    "frontend/package-lock.json"
-  ],
+  "allowed_files": [],
   "allowed_suffixes": [
-    ".ts",
-    ".tsx",
-    ".json"
+    ".py"
   ],
   "round_focus": [
-    "第一轮：只修改 frontend/package.json、frontend/package-lock.json，并新建 frontend/tests/scanFlow.spec.ts；加入 @playwright/test 和 test:e2e 命令，固定使用 Windows 已安装的 msedge，不执行浏览器下载。以真实浏览器打开 Vite 页面，拦截 /api/health 与 /api/scans，选择一个允许的代码文件，点击开始扫描，断言仅允许文件的路径与文本进入请求，并在页面看到 done、问题数、rule_id、证据和建议。总改动控制在上述三个文件。",
-    "第二轮：仍限上述三个文件，补一个混合选择场景和一个失败场景：敏感文件或不支持文件必须在页面显示排除原因且绝不进入 /api/scans 请求；服务端 413 的 too_many_findings 或 scan_output_too_large 必须显示已有可读错误且不能出现成功结果。若真实浏览器揭示生产缺陷，才允许最小修改 frontend/src/App.tsx 或 frontend/src/scanApi.ts，并必须在报告中说明原因和证据。",
-    "第三轮：只补稳定性回归：健康检查显示、扫描按钮 loading/恢复、零 Finding 成功结果，以及 UTF-8 路径/证据渲染；不得重复覆盖同一行为。固定运行前端现有 18 项 Node 测试、Playwright Edge 测试、build、lint，以及后端全部测试；逐项发布命令和真实输出。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若机器没有 Edge、依赖安装失败或需要扩大文件范围，立即 needs_human 停止询问。"
+    "第一轮：只新建 backend/local_ai.py 与 backend/tests/test_local_ai.py。实现独立服务层：最多分析 50 个 Finding，按严重度稳定排序；请求 JSON 与提示词设置明确 UTF-8 字节上限，响应读取最多 256 KiB；固定请求 http://127.0.0.1:11434/api/chat，stream=false，format 使用 JSON Schema，think=false。传输必须可注入，单元测试只用假传输并断言不会访问真实网络；严格解析 summary 与 priorities，拒绝非 JSON、缺字段、超长文本、未知 Finding 引用和重复引用。不得修改 main.py。",
+    "第二轮：限 backend/main.py、backend/local_ai.py、backend/tests/test_local_ai.py。新增 POST /analyses，输入复用现有 Finding 字段，输出包含 status、model、total_count、analyzed_count、summary、priorities；请求体也必须受现有 8 MiB 中间件保护。把本机服务未启动/超时、上游非 2xx、响应过大、结构错误分别映射为稳定错误码与合适 HTTP 状态，错误中不得回显提示词、模型原文或源码。补 ASGI 级成功和失败测试；测试不得依赖本机 Ollama。",
+    "第三轮：仍只限上述三个文件，补边界回归：0 个 Finding 不调用模型并返回确定结果；超过 50 个只按已声明规则选择且准确报告 total_count/analyzed_count；UTF-8 路径与中文摘要按字节限额；恶意模型输出不能注入额外 Finding 或超长内容；环境变量模型名非法时安全失败。固定运行 backend 全部 unittest，并确认现有扫描接口与 8 MiB 分片中间件测试仍通过。报告只贴命令、总数、失败数与必要错误摘要，避免 GitHub 单条超预算。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若必须新增依赖、修改前端/工作流/旧证据报告脚本、访问非回环地址或需要人工启动模型，立即 needs_human 停止询问。"
   ]
 }
