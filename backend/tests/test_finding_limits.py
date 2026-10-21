@@ -136,6 +136,7 @@ class FindingLimitTests(unittest.TestCase):
                 )
 
         self.assertEqual(caught.exception.limit, MAX_FINDINGS)
+        self.assertIn(f"最多允许 {MAX_FINDINGS} 条", str(caught.exception))
         self.assertEqual(finding_class.call_count, MAX_FINDINGS)
 
 

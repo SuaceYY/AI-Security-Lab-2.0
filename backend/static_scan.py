@@ -62,7 +62,7 @@ class FindingLimitExceeded(ValueError):
     """表示本次扫描发现的 Finding 数量超过调用方给定上限。"""
 
     def __init__(self, limit: int) -> None:
-        super().__init__(f"Finding 数量超过上限 {limit}。")
+        super().__init__(f"本次调用最多允许 {limit} 条 Finding。")
         self.limit = limit
 
 
