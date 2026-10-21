@@ -28,6 +28,28 @@ class RuntimeTests(unittest.TestCase):
         batch.issue = 1
         return batch
 
+    def test_development_third_round_receives_approved_focus(self):
+        with tempfile.TemporaryDirectory() as folder:
+            batch = self.batch(Path(folder))
+            batch.begin_call = Mock()
+            batch.prompt = Mock(return_value="bound-session-prompt")
+            batch.sessions = Mock()
+            batch.sessions.call.return_value = "executor report"
+            batch.result = Mock(return_value={"status": "done"})
+            batch.capture = Mock(return_value={"id": 3})
+            focus = "只检查 POST /scans 请求体字节上限，不重复前端 Findings 功能"
+            prior = {"round": 2, "status": "done"}
+
+            result = batch.develop(3, focus, prior)
+
+            self.assertEqual(result, {"id": 3})
+            batch.begin_call.assert_called_once_with(3, "development")
+            self.assertEqual(batch.prompt.call_args.args[:2], (3, "development"))
+            self.assertEqual(batch.prompt.call_args.args[2]["本轮开发子步骤"], focus)
+            self.assertEqual(batch.prompt.call_args.args[2]["上一轮已发布结果"], prior)
+            batch.sessions.call.assert_called_once_with("executor", "bound-session-prompt")
+            batch.capture.assert_called_once_with(3, "development", "executor report", {"status": "done"})
+
     def test_large_github_body_uses_json_file_and_removes_it(self):
         with tempfile.TemporaryDirectory() as folder:
             batch = self.batch(Path(folder))
