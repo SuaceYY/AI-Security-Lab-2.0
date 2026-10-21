@@ -41,6 +41,32 @@ export interface ScanResponse {
   findings: ScanFinding[]
 }
 
+export interface AnalysisRequest {
+  findings: ScanFinding[]
+}
+
+export type FindingPriorityLevel = 'critical' | 'high' | 'medium' | 'low'
+
+export interface FindingPriority {
+  finding_index: number
+  priority: FindingPriorityLevel
+  reason: string
+}
+
+export interface AnalysisResponse {
+  status: 'done'
+  model: string
+  total_count: number
+  analyzed_count: number
+  summary: string
+  priorities: FindingPriority[]
+}
+
+export interface MatchedFindingPriority {
+  finding: ScanFinding
+  priority: FindingPriority
+}
+
 export interface TextFileLike {
   text(): Promise<string>
 }
@@ -48,6 +74,8 @@ export interface TextFileLike {
 const TASK_STATUSES: readonly ScanResponse['status'][] = ['queued', 'running', 'done', 'failed']
 const FILE_STATUSES: readonly ScannedFile['status'][] = ['scanned', 'skipped']
 const SEVERITIES: readonly ScanSeverity[] = ['high', 'medium', 'low', 'info']
+const FINDING_PRIORITIES: readonly FindingPriorityLevel[] = ['critical', 'high', 'medium', 'low']
+export const MAX_ANALYSIS_FINDINGS = 50
 
 const TASK_STATUS_LABELS: Record<ScanResponse['status'], string> = {
   queued: '排队中',
@@ -71,6 +99,21 @@ const SCAN_ERROR_MESSAGES: Record<string, string> = {
   invalid_request: '请求格式不合法，请重新选择文件后重试。',
 }
 
+const ANALYSIS_ERROR_MESSAGES: Record<string, string> = {
+  empty_finding_list: '没有可分析的 Finding，请先完成扫描。',
+  invalid_model: '本地 AI 模型配置无效，请联系管理员检查模型配置。',
+  model_endpoint_invalid: '本地 AI 服务地址配置无效，请联系管理员检查配置。',
+  model_unavailable: '无法连接本地 AI 服务，请确认 Ollama 已启动后重试。',
+  model_timeout: '本地 AI 分析超时，请稍后重试。',
+  model_http_error: '本地 AI 服务返回异常状态，请稍后重试。',
+  model_response_too_large: '本地 AI 返回内容过大，请稍后重试。',
+  model_invalid_response: '本地 AI 返回了无效的分析结果，请稍后重试。',
+  analysis_request_too_large: '提交的分析请求超过服务端上限，请减少 Finding 后重试。',
+  request_too_large: '请求体超过服务端上限，请减少 Finding 后重试。',
+  invalid_request: '请求格式不合法，请重新扫描后重试。',
+  invalid_finding: 'Finding 格式不合法，请重新扫描后重试。',
+}
+
 export class ScanRequestError extends Error {
   status: number
   code?: string
@@ -82,6 +125,18 @@ export class ScanRequestError extends Error {
     this.status = status
     this.code = code
     this.serverMessage = serverMessage
+  }
+}
+
+export class AnalysisRequestError extends Error {
+  status: number
+  code?: string
+
+  constructor(status: number, code?: string) {
+    super(`分析请求失败（HTTP ${status}）`)
+    this.name = 'AnalysisRequestError'
+    this.status = status
+    this.code = code
   }
 }
 
@@ -155,10 +210,100 @@ function isScanResponse(value: unknown): value is ScanResponse {
   )
 }
 
+function isFindingPriority(value: unknown): value is FindingPriority {
+  return (
+    isRecord(value) &&
+    isNonNegativeSafeInteger(value.finding_index) &&
+    isOneOf(value.priority, FINDING_PRIORITIES) &&
+    isNonEmptyString(value.reason)
+  )
+}
+
+function isAnalysisResponse(value: unknown, submittedCount: number): value is AnalysisResponse {
+  if (
+    !isRecord(value) ||
+    value.status !== 'done' ||
+    !isNonEmptyString(value.model) ||
+    !isNonEmptyString(value.summary) ||
+    !isNonNegativeSafeInteger(value.total_count) ||
+    !isNonNegativeSafeInteger(value.analyzed_count) ||
+    !Array.isArray(value.priorities)
+  ) {
+    return false
+  }
+
+  const totalCount = value.total_count
+  const analyzedCount = value.analyzed_count
+
+  if (
+    totalCount !== submittedCount ||
+    analyzedCount > MAX_ANALYSIS_FINDINGS ||
+    analyzedCount > totalCount ||
+    value.priorities.length !== analyzedCount
+  ) {
+    return false
+  }
+
+  const seenIndices = new Set<number>()
+  for (const item of value.priorities) {
+    if (
+      !isFindingPriority(item) ||
+      item.finding_index >= totalCount ||
+      seenIndices.has(item.finding_index)
+    ) {
+      return false
+    }
+    seenIndices.add(item.finding_index)
+  }
+
+  return true
+}
+
 export function buildScanRequest(files: readonly ScanFileInput[]): ScanRequest {
   return {
     files: files.map(({ file_path, content }) => ({ file_path, content })),
   }
+}
+
+export function buildAnalysisRequest(findings: readonly ScanFinding[]): AnalysisRequest {
+  return {
+    findings: findings.map(
+      ({ rule_id, severity, file_path, line, evidence, explanation, recommendation }) => ({
+        rule_id,
+        severity,
+        file_path,
+        line,
+        evidence,
+        explanation,
+        recommendation,
+      }),
+    ),
+  }
+}
+
+export function matchFindingPriorities(
+  findings: readonly ScanFinding[],
+  priorities: readonly FindingPriority[],
+): MatchedFindingPriority[] {
+  const seenIndices = new Set<number>()
+  const matches: MatchedFindingPriority[] = []
+
+  for (const priority of priorities) {
+    const index = priority.finding_index
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= findings.length ||
+      seenIndices.has(index)
+    ) {
+      continue
+    }
+
+    seenIndices.add(index)
+    matches.push({ finding: findings[index], priority })
+  }
+
+  return matches
 }
 
 export async function readAllowedFiles<T extends TextFileLike>(
@@ -205,6 +350,42 @@ export function formatScanError(error: unknown): string {
   }
 
   return '扫描失败：未知错误。'
+}
+
+export function parseAnalysisError(status: number, payload: unknown): AnalysisRequestError {
+  const detail = isRecord(payload) && isRecord(payload.detail) ? payload.detail : null
+  const code = typeof detail?.code === 'string' ? detail.code : undefined
+
+  return new AnalysisRequestError(status, code)
+}
+
+export function formatAnalysisError(error: unknown): string {
+  if (error instanceof AnalysisRequestError) {
+    const mapped = error.code ? ANALYSIS_ERROR_MESSAGES[error.code] : undefined
+    if (mapped) {
+      return mapped
+    }
+
+    if (error.code?.startsWith('model_')) {
+      return '本地 AI 分析失败，请确认本地模型服务可用后重试。'
+    }
+
+    if (error.status === 0) {
+      return '无法连接分析服务，请确认后端服务已启动。'
+    }
+
+    if (error.status === 200) {
+      return '分析失败：服务端返回了无法识别的分析结果。'
+    }
+
+    return `分析失败（HTTP ${error.status}）。`
+  }
+
+  if (error instanceof Error) {
+    return `分析失败：${error.message}`
+  }
+
+  return '分析失败：未知错误。'
 }
 
 export function formatTaskStatus(status: ScanResponse['status']): string {
@@ -255,6 +436,44 @@ export async function submitScan(
 
   if (!isScanResponse(payload)) {
     throw new ScanRequestError(response.status, undefined, '服务端返回了无法识别的结果。')
+  }
+
+  return payload
+}
+
+export async function submitAnalysis(
+  findings: readonly ScanFinding[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<AnalysisResponse> {
+  if (findings.length === 0) {
+    throw new AnalysisRequestError(0, 'empty_finding_list')
+  }
+
+  let response: Response
+
+  try {
+    response = await fetchImpl('/api/analyses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildAnalysisRequest(findings)),
+    })
+  } catch {
+    throw new AnalysisRequestError(0)
+  }
+
+  let payload: unknown = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+
+  if (!response.ok) {
+    throw parseAnalysisError(response.status, payload)
+  }
+
+  if (!isAnalysisResponse(payload, findings.length)) {
+    throw new AnalysisRequestError(response.status)
   }
 
   return payload
