@@ -69,6 +69,59 @@ def scan_file(path: str, content: str) -> dict:
     return {"file_path": path, "content": content}
 
 
+def request_from_chunks(
+    chunks: list[bytes], extra_headers: list[tuple[bytes, bytes]]
+) -> tuple[int, dict, int]:
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/scans",
+        "raw_path": b"/scans",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            *extra_headers,
+        ],
+        "server": ("testserver", 80),
+        "client": ("testclient", 12345),
+        "state": {},
+    }
+    messages: list[dict] = []
+    chunk_index = 0
+    received_chunks = 0
+
+    async def receive() -> dict:
+        nonlocal chunk_index, received_chunks
+        if chunk_index >= len(chunks):
+            return {"type": "http.disconnect"}
+        body = chunks[chunk_index]
+        chunk_index += 1
+        received_chunks += 1
+        return {
+            "type": "http.request",
+            "body": body,
+            "more_body": chunk_index < len(chunks),
+        }
+
+    async def send(message: dict) -> None:
+        messages.append(message)
+
+    asyncio.run(main.app(scope, receive, send))
+
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], json.loads(response_body.decode("utf-8")), received_chunks
+
+
 class HealthTests(unittest.TestCase):
     def test_health_returns_ok(self):
         status, payload = request("GET", "/health")
@@ -81,6 +134,63 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"message": "AI-Security-Lab 2.0 API is running"})
+
+
+class RequestBodyLimitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        body = json.dumps(
+            {
+                "files": [
+                    scan_file(
+                        "src/large.py",
+                        "a" * (main.MAX_SCAN_REQUEST_BODY_BYTES + 2048),
+                    )
+                ]
+            }
+        ).encode("utf-8")
+        boundaries = (3 * 1024 * 1024, 6 * 1024 * 1024, main.MAX_SCAN_REQUEST_BODY_BYTES + 1024)
+        cls.chunks = [
+            body[: boundaries[0]],
+            body[boundaries[0] : boundaries[1]],
+            body[boundaries[1] : boundaries[2]],
+            body[boundaries[2] :],
+        ]
+
+    def assert_rejected_before_scan(self, extra_headers):
+        with patch.object(main, "run_scan") as run_scan:
+            status, payload, received_chunks = request_from_chunks(
+                self.chunks, extra_headers
+            )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            payload,
+            {
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": main.REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        self.assertEqual(sum(map(len, self.chunks[:2])), 6 * 1024 * 1024)
+        self.assertGreater(
+            sum(map(len, self.chunks[:3])),
+            main.MAX_SCAN_REQUEST_BODY_BYTES,
+        )
+        self.assertTrue(self.chunks[3])
+        self.assertEqual(received_chunks, 3)
+        run_scan.assert_not_called()
+
+    def test_no_content_length_counts_multiple_asgi_chunks(self):
+        self.assert_rejected_before_scan([])
+
+    def test_chunked_counts_multiple_asgi_chunks(self):
+        self.assert_rejected_before_scan([(b"transfer-encoding", b"chunked")])
+
+    def test_understated_content_length_counts_actual_bytes(self):
+        self.assert_rejected_before_scan([(b"content-length", b"1024")])
 
 
 class ScanEndpointTests(unittest.TestCase):
