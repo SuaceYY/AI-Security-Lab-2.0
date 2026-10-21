@@ -9,7 +9,9 @@ from pathlib import Path
 from unittest.mock import patch, Mock
 
 from tools.dual_ai.web_batch import HumanRequired
-from tools.dual_ai.web_batch_runtime import (\n    WebBatch, FENCE, format_compatibility_checkpoint, generated_review_summary,\n)
+from tools.dual_ai.web_batch_runtime import (
+    WebBatch, FENCE, format_compatibility_checkpoint, generated_review_summary,
+)
 from tools.issue_claimer import claimer as worker
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
