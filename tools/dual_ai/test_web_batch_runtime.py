@@ -54,6 +54,15 @@ class GeneratedReviewSummaryTests(unittest.TestCase):
     def test_non_generated_source_keeps_normal_snapshot_path(self):
         self.assertIsNone(generated_review_summary("frontend/src/App.tsx", "source"))
 
+    def test_in_scope_source_pause_is_eligible_for_bounded_resnapshot(self):
+        batch = WebBatch("web-test-001", PLAN)
+        self.assertTrue(batch._verified_development_pause_allowed(
+            "源码文件超出本批逐文件审查预算：backend/tests/test_local_ai.py"
+        ))
+        self.assertFalse(batch._verified_development_pause_allowed(
+            "源码文件超出本批逐文件审查预算：frontend/src/App.tsx"
+        ))
+
 
 class RuntimeTests(unittest.TestCase):
     def batch(self, root):
@@ -63,6 +72,43 @@ class RuntimeTests(unittest.TestCase):
         batch.base_sha = "base"
         batch.issue = 1
         return batch
+
+    def test_snapshot_accepts_bounded_24k_source_and_omits_frontend_context(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "backend/tests/test_local_ai.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("x" * 24000, encoding="utf-8")
+            main = root / "backend/main.py"
+            main.write_text("app = object()\n", encoding="utf-8")
+            batch = self.batch(root)
+            with (patch(RUNTIME + "ROOT", root),
+                  patch(RUNTIME + "command",
+                        return_value="backend/tests/test_local_ai.py"),
+                  patch(RUNTIME + "collect_changed_paths", return_value=[])):
+                snapshot = batch.snapshot(False)
+            self.assertEqual(
+                len(snapshot["files"]["backend/tests/test_local_ai.py"]["content"]),
+                24000,
+            )
+            self.assertIn("backend/main.py", snapshot["files"])
+            self.assertNotIn("frontend/src/App.tsx", snapshot["files"])
+
+    def test_snapshot_still_rejects_source_over_32k(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "backend/tests/test_local_ai.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("x" * (32 * 1024 + 1), encoding="utf-8")
+            main = root / "backend/main.py"
+            main.write_text("app = object()\n", encoding="utf-8")
+            batch = self.batch(root)
+            with (patch(RUNTIME + "ROOT", root),
+                  patch(RUNTIME + "command",
+                        return_value="backend/tests/test_local_ai.py"),
+                  patch(RUNTIME + "collect_changed_paths", return_value=[]),
+                  self.assertRaises(HumanRequired)):
+                batch.snapshot(False)
 
     def test_development_third_round_receives_approved_focus(self):
         with tempfile.TemporaryDirectory() as folder:
