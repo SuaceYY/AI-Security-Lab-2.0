@@ -33,12 +33,13 @@ class RequestBodyLimitMiddleware:
             await self._send_too_large(scope, receive, send)
             return
 
-        messages: list[Message] = []
+        body = bytearray()
+        disconnected = False
         received_bytes = 0
         while True:
             message = await receive()
-            messages.append(message)
             if message["type"] == "http.disconnect":
+                disconnected = True
                 break
             if message["type"] != "http.request":
                 continue
@@ -47,9 +48,22 @@ class RequestBodyLimitMiddleware:
             if received_bytes > MAX_SCAN_REQUEST_BODY_BYTES:
                 await self._send_too_large(scope, receive, send)
                 return
+            body.extend(message.get("body", b""))
             if not message.get("more_body", False):
                 break
 
+        # ASGI transport fragments can be arbitrarily small. Retain at most
+        # one body plus a disconnect, rather than one dictionary per fragment.
+        messages: list[Message] = []
+        if body or not disconnected:
+            messages.append({
+                "type": "http.request",
+                "body": bytes(body),
+                "more_body": disconnected,
+            })
+        if disconnected:
+            messages.append({"type": "http.disconnect"})
+        del body
         message_index = 0
 
         async def replay_receive() -> Message:
