@@ -529,7 +529,8 @@ class TransportErrorTests(unittest.TestCase):
 
 class AnalysisEndpointTests(unittest.TestCase):
     def post_with_transport(self, transport, findings=None):
-        findings = findings or [finding().to_dict()]
+        if findings is None:
+            findings = [finding().to_dict()]
         with (
             patch.dict(os.environ, {MODEL_ENV_VAR: ""}, clear=False),
             patch.object(
@@ -575,6 +576,159 @@ class AnalysisEndpointTests(unittest.TestCase):
         self.assertEqual(transport.calls[0]["url"], OLLAMA_CHAT_URL)
         prompted = prompt_findings(transport.calls[0]["body"])
         self.assertEqual(prompted[0]["file_path"], "src/file1.py")
+
+    def test_asgi_zero_findings_is_deterministic_without_transport(self):
+        transport = FakeTransport(error=AssertionError("不应调用传输"))
+
+        status, payload = self.post_with_transport(transport, [])
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {
+            "status": "done",
+            "model": DEFAULT_MODEL,
+            "total_count": 0,
+            "analyzed_count": 0,
+            "summary": "没有可分析的 Finding。",
+            "priorities": [],
+        })
+        self.assertEqual(transport.calls, [])
+
+    def test_asgi_more_than_50_selects_by_severity_and_reports_counts(self):
+        findings = []
+        for index in range(60):
+            if index < 25:
+                severity = "low"
+            elif index < 45:
+                severity = "medium"
+            elif index < 55:
+                severity = "high"
+            else:
+                severity = "info"
+            findings.append(finding(index + 1, severity=severity).to_dict())
+
+        expected_indices = (
+            list(range(45, 55))
+            + list(range(25, 45))
+            + list(range(0, 20))
+        )
+        transport = FakeTransport(responder=valid_responder())
+        status, payload = self.post_with_transport(transport, findings)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["total_count"], 60)
+        self.assertEqual(payload["analyzed_count"], MAX_ANALYSIS_FINDINGS)
+        self.assertEqual(
+            [item["finding_index"] for item in payload["priorities"]],
+            expected_indices,
+        )
+        prompted = prompt_findings(transport.calls[0]["body"])
+        self.assertEqual(
+            [item["finding_index"] for item in prompted],
+            expected_indices,
+        )
+
+    def test_accepts_exact_utf8_byte_boundaries_with_chinese_path(self):
+        summary = "中" * ((MAX_SUMMARY_BYTES - 1) // 3) + "a"
+        reason = "中" * ((MAX_REASON_BYTES - 1) // 3) + "a"
+        self.assertEqual(len(summary.encode("utf-8")), MAX_SUMMARY_BYTES)
+        self.assertEqual(len(reason.encode("utf-8")), MAX_REASON_BYTES)
+
+        data = finding(1).to_dict()
+        data["file_path"] = "目录/模块/文件.py"
+        transport = FakeTransport(
+            response_body=chat_response({
+                "summary": summary,
+                "priorities": [
+                    {
+                        "finding_index": 0,
+                        "priority": "high",
+                        "reason": reason,
+                    }
+                ],
+            })
+        )
+
+        with patch.dict(os.environ, {MODEL_ENV_VAR: ""}, clear=False):
+            result = analyze_findings([data], transport=transport)
+
+        self.assertEqual(result.summary, summary)
+        self.assertEqual(result.priorities[0].reason, reason)
+        prompted = prompt_findings(transport.calls[0]["body"])
+        self.assertEqual(prompted[0]["file_path"], "目录/模块/文件.py")
+
+    def test_asgi_rejects_utf8_path_over_prompt_byte_limit(self):
+        data = finding(1).to_dict()
+        data["file_path"] = "目录/" + "中" * (MAX_PROMPT_BYTES // 3 + 2)
+        transport = FakeTransport(responder=valid_responder())
+
+        status, payload = self.post_with_transport(transport, [data])
+
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["detail"]["code"], "analysis_request_too_large")
+        self.assertEqual(transport.calls, [])
+
+    def test_asgi_rejects_injected_or_overlong_model_output(self):
+        valid_priority = {
+            "finding_index": 0,
+            "priority": "high",
+            "reason": "理由",
+        }
+        cases = [
+            (
+                "extra_finding",
+                {
+                    "summary": "摘要",
+                    "priorities": [valid_priority],
+                    "findings": [{"rule_id": "INJECTED_FINDING"}],
+                },
+                "INJECTED_FINDING",
+            ),
+            (
+                "extra_priority_field",
+                {
+                    "summary": "摘要",
+                    "priorities": [
+                        {**valid_priority, "file_path": "INJECTED_PRIORITY"}
+                    ],
+                },
+                "INJECTED_PRIORITY",
+            ),
+            (
+                "overlong_summary",
+                {
+                    "summary": "中" * ((MAX_SUMMARY_BYTES - 1) // 3) + "aa",
+                    "priorities": [valid_priority],
+                },
+                "",
+            ),
+            (
+                "overlong_reason",
+                {
+                    "summary": "摘要",
+                    "priorities": [
+                        {
+                            **valid_priority,
+                            "reason": "中" * ((MAX_REASON_BYTES - 1) // 3) + "aa",
+                        }
+                    ],
+                },
+                "",
+            ),
+        ]
+
+        for name, content, sentinel in cases:
+            with self.subTest(name=name):
+                transport = FakeTransport(response_body=chat_response(content))
+                status, payload = self.post_with_transport(transport)
+
+                self.assertEqual(status, 502)
+                self.assertEqual(payload["detail"]["code"], "model_invalid_response")
+                self.assertNotIn("priorities", payload)
+                if sentinel:
+                    self.assertNotIn(
+                        sentinel,
+                        json.dumps(payload, ensure_ascii=False),
+                    )
 
     def test_asgi_maps_local_ai_failures_to_stable_errors(self):
         cases = [
