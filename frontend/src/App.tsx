@@ -1,11 +1,15 @@
-﻿import { useEffect, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import { filterFiles, type FilterResult } from './fileFilter.ts'
 import {
   describeScanResult,
+  formatAnalysisError,
   formatScanError,
   formatTaskStatus,
+  matchFindingPriorities,
   readAllowedFiles,
+  submitAnalysis,
   submitScan,
+  type AnalysisResponse,
   type ScanResponse,
 } from './scanApi.ts'
 
@@ -15,10 +19,19 @@ type ScanState =
   | { kind: 'success'; result: ScanResponse }
   | { kind: 'error'; message: string }
 
+type AnalysisState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'success'; result: AnalysisResponse }
+  | { kind: 'error'; message: string }
+
 function App() {
   const [status, setStatus] = useState('检查中...')
   const [result, setResult] = useState<FilterResult<File> | null>(null)
   const [scanState, setScanState] = useState<ScanState>({ kind: 'idle' })
+  const [analysisState, setAnalysisState] = useState<AnalysisState>({ kind: 'idle' })
+  const analysisRequestId = useRef(0)
+  const analysisInFlight = useRef(false)
 
   useEffect(() => {
     fetch('/api/health')
@@ -27,7 +40,15 @@ function App() {
       .catch(() => setStatus('后端连接失败'))
   }, [])
 
+  const resetAnalysis = () => {
+    analysisRequestId.current += 1
+    analysisInFlight.current = false
+    setAnalysisState({ kind: 'idle' })
+  }
+
   const handleScan = async () => {
+    resetAnalysis()
+
     if (!result || result.allowed.length === 0) {
       setScanState({ kind: 'error', message: '没有可提交的允许文件，请重新选择。' })
       return
@@ -42,6 +63,41 @@ function App() {
       setScanState({ kind: 'error', message: formatScanError(error) })
     }
   }
+
+  const handleAnalysis = async () => {
+    if (
+      scanState.kind !== 'success' ||
+      scanState.result.findings.length === 0 ||
+      analysisInFlight.current
+    ) {
+      return
+    }
+
+    const requestId = analysisRequestId.current + 1
+    analysisRequestId.current = requestId
+    analysisInFlight.current = true
+    setAnalysisState({ kind: 'loading' })
+
+    try {
+      const analysisResult = await submitAnalysis(scanState.result.findings)
+      if (analysisRequestId.current === requestId) {
+        setAnalysisState({ kind: 'success', result: analysisResult })
+      }
+    } catch (error) {
+      if (analysisRequestId.current === requestId) {
+        setAnalysisState({ kind: 'error', message: formatAnalysisError(error) })
+      }
+    } finally {
+      if (analysisRequestId.current === requestId) {
+        analysisInFlight.current = false
+      }
+    }
+  }
+
+  const analysisMatches =
+    scanState.kind === 'success' && analysisState.kind === 'success'
+      ? matchFindingPriorities(scanState.result.findings, analysisState.result.priorities)
+      : []
 
   return (
     <main style={{ padding: 40, maxWidth: 900, margin: 'auto' }}>
@@ -61,6 +117,7 @@ function App() {
           const selected = Array.from(event.target.files || [])
           setResult(filterFiles(selected))
           setScanState({ kind: 'idle' })
+          resetAnalysis()
         }}
       />
 
@@ -147,6 +204,65 @@ function App() {
                     </li>
                   ))}
                 </ul>
+              )}
+
+              {scanState.result.findings.length > 0 && (
+                <>
+                  <p>
+                    仅发送上述 Finding 的七个字段，不会再次发送完整源码；AI
+                    结果仅供参考，需要人工复核。
+                  </p>
+
+                  <button
+                    type="button"
+                    onClick={handleAnalysis}
+                    disabled={analysisState.kind === 'loading'}
+                  >
+                    {analysisState.kind === 'loading'
+                      ? '本地 AI 分析中...'
+                      : '使用本地 AI 分析优先级'}
+                  </button>
+
+                  {analysisState.kind === 'loading' && <p>正在请求本地 AI 分析...</p>}
+
+                  {analysisState.kind === 'error' && (
+                    <p role="alert">分析错误：{analysisState.message}</p>
+                  )}
+
+                  {analysisState.kind === 'success' && (
+                    <>
+                      <h3>本地 AI 分析结果</h3>
+                      <p>本地模型：{analysisState.result.model}</p>
+                      <p>分析摘要：{analysisState.result.summary}</p>
+                      <p>
+                        分析数量：{analysisState.result.analyzed_count} /{' '}
+                        {analysisState.result.total_count}
+                      </p>
+
+                      {analysisState.result.analyzed_count <
+                        scanState.result.findings.length && (
+                        <p>仅展示模型实际分析的 Finding。</p>
+                      )}
+
+                      <ul style={{ textAlign: 'left', paddingLeft: 20 }}>
+                        {analysisMatches.map(({ finding, priority }) => (
+                          <li
+                            key={`${priority.finding_index}:${finding.file_path}:${finding.line}:${finding.rule_id}`}
+                            style={{ marginBottom: 12 }}
+                          >
+                            <div>
+                              <code>
+                                {finding.file_path}:{finding.line}
+                              </code>{' '}
+                              [{priority.priority}] {finding.rule_id}
+                            </div>
+                            <div>理由：{priority.reason}</div>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </>
               )}
 
               <details style={{ marginTop: 16, textAlign: 'left' }}>

@@ -62,6 +62,11 @@ export interface AnalysisResponse {
   priorities: FindingPriority[]
 }
 
+export interface MatchedFindingPriority {
+  finding: ScanFinding
+  priority: FindingPriority
+}
+
 export interface TextFileLike {
   text(): Promise<string>
 }
@@ -273,6 +278,31 @@ export function buildAnalysisRequest(findings: readonly ScanFinding[]): Analysis
       }),
     ),
   }
+}
+
+export function matchFindingPriorities(
+  findings: readonly ScanFinding[],
+  priorities: readonly FindingPriority[],
+): MatchedFindingPriority[] {
+  const seenIndices = new Set<number>()
+  const matches: MatchedFindingPriority[] = []
+
+  for (const priority of priorities) {
+    const index = priority.finding_index
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= findings.length ||
+      seenIndices.has(index)
+    ) {
+      continue
+    }
+
+    seenIndices.add(index)
+    matches.push({ finding: findings[index], priority })
+  }
+
+  return matches
 }
 
 export async function readAllowedFiles<T extends TextFileLike>(

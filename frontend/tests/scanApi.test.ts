@@ -9,6 +9,7 @@ import {
   formatAnalysisError,
   formatScanError,
   formatTaskStatus,
+  matchFindingPriorities,
   MAX_ANALYSIS_FINDINGS,
   parseAnalysisError,
   parseScanError,
@@ -477,6 +478,85 @@ test('提交分析请求使用固定路径并返回严格校验的成功结果',
   assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
     findings: [VALID_FINDING],
   })
+})
+
+test('提交分析后按 finding_index 安全关联原 Finding', async () => {
+  const findings: ScanFinding[] = [
+    VALID_FINDING,
+    {
+      ...VALID_FINDING,
+      rule_id: 'PY-OS-SYSTEM',
+      line: 2,
+      evidence: 'os.system(command)',
+    },
+  ]
+  const response: AnalysisResponse = {
+    ...VALID_ANALYSIS_RESPONSE,
+    total_count: 2,
+    analyzed_count: 2,
+    priorities: [
+      { finding_index: 1, priority: 'critical', reason: '可能执行攻击者控制的命令。' },
+      { finding_index: 0, priority: 'high', reason: '动态执行用户输入可能导致代码注入。' },
+    ],
+  }
+
+  const result = await submitAnalysis(findings, successfulFetch(response))
+  const matches = matchFindingPriorities(findings, result.priorities)
+
+  assert.deepEqual(
+    matches.map(({ finding, priority }) => ({
+      rule_id: finding.rule_id,
+      line: finding.line,
+      finding_index: priority.finding_index,
+      priority: priority.priority,
+      reason: priority.reason,
+    })),
+    [
+      {
+        rule_id: 'PY-OS-SYSTEM',
+        line: 2,
+        finding_index: 1,
+        priority: 'critical',
+        reason: '可能执行攻击者控制的命令。',
+      },
+      {
+        rule_id: 'PY-EVAL-EXEC',
+        line: 1,
+        finding_index: 0,
+        priority: 'high',
+        reason: '动态执行用户输入可能导致代码注入。',
+      },
+    ],
+  )
+})
+
+test('忽略越界、负数、非整数与重复的优先级索引', () => {
+  const findings = [
+    VALID_FINDING,
+    { ...VALID_FINDING, rule_id: 'PY-OS-SYSTEM', line: 2 },
+    { ...VALID_FINDING, rule_id: 'JS-EVAL', line: 3 },
+  ]
+
+  const matches = matchFindingPriorities(findings, [
+    { finding_index: 2, priority: 'low', reason: '低风险。' },
+    { finding_index: 0, priority: 'critical', reason: '高风险。' },
+    { finding_index: 9, priority: 'high', reason: '越界索引。' },
+    { finding_index: -1, priority: 'high', reason: '负数索引。' },
+    { finding_index: 1.5, priority: 'high', reason: '非整数索引。' },
+    { finding_index: 2, priority: 'medium', reason: '重复索引。' },
+  ])
+
+  assert.deepEqual(
+    matches.map(({ finding, priority }) => ({
+      rule_id: finding.rule_id,
+      finding_index: priority.finding_index,
+      priority: priority.priority,
+    })),
+    [
+      { rule_id: 'JS-EVAL', finding_index: 2, priority: 'low' },
+      { rule_id: 'PY-EVAL-EXEC', finding_index: 0, priority: 'critical' },
+    ],
+  )
 })
 
 test('拒绝畸形分析 HTTP 200 响应', async () => {
