@@ -11,6 +11,7 @@ from unittest.mock import patch, Mock
 from tools.dual_ai.web_batch import HumanRequired
 from tools.dual_ai.web_batch_runtime import (
     WebBatch, FENCE, format_compatibility_checkpoint, generated_review_summary,
+    pending_review_without_model, review_prompt_manifest,
 )
 from tools.issue_claimer import claimer as worker
 
@@ -61,6 +62,77 @@ class GeneratedReviewSummaryTests(unittest.TestCase):
         ))
         self.assertFalse(batch._verified_development_pause_allowed(
             "源码文件超出本批逐文件审查预算：frontend/src/App.tsx"
+        ))
+
+
+class ReviewContextTests(unittest.TestCase):
+    def test_manifest_omits_full_source_and_bounds_test_output(self):
+        source = "SECRET_SOURCE_SENTINEL" + "x" * 24000
+        output = "SECRET_LOG_PREFIX" + "y" * 5000
+        report = {
+            "batch_id": "web-s2-b006",
+            "round": 3,
+            "phase": "development",
+            "head_sha": "a" * 40,
+            "pr": 44,
+            "source_hash": "b" * 64,
+            "model_result": {"status": "done", "summary": "完成"},
+            "source": {
+                "origin": "github_commit",
+                "files": {
+                    "backend/tests/test_local_ai.py": {
+                        "sha": "c" * 40,
+                        "content": source,
+                    }
+                },
+            },
+            "verification": {
+                "ok": True,
+                "reason": "固定验证通过",
+                "steps": [{
+                    "label": "backend tests",
+                    "command": ["python", "-m", "unittest"],
+                    "cwd": ".",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "output": output,
+                }],
+            },
+        }
+
+        manifest = review_prompt_manifest(report)
+        encoded = json.dumps(manifest, ensure_ascii=False)
+
+        self.assertNotIn("SECRET_SOURCE_SENTINEL", encoded)
+        self.assertNotIn("SECRET_LOG_PREFIX", encoded)
+        item = manifest["source_files"]["backend/tests/test_local_ai.py"]
+        self.assertEqual(item["bytes"], len(source.encode("utf-8")))
+        self.assertEqual(item["sha256"], hashlib.sha256(source.encode("utf-8")).hexdigest())
+        step = manifest["verification"]["steps"][0]
+        self.assertLessEqual(len(step["output_tail"]), 1200)
+        self.assertEqual(step["output_sha256"], hashlib.sha256(output.encode("utf-8")).hexdigest())
+
+    def test_pending_review_requires_one_marker_and_no_model_event(self):
+        previous = {
+            "action": "review",
+            "question": "单次任务超过上下文安全预算，请人工缩小任务。",
+            "context_events": [],
+        }
+        comments = [{
+            "body": "<!-- web-batch=web-s2-b006 round=3 phase=review_started -->"
+        }]
+
+        self.assertTrue(pending_review_without_model(
+            previous, comments, "web-s2-b006", 3
+        ))
+
+        previous["context_events"] = [{
+            "round": 3,
+            "phase": "model_usage",
+            "data": {"role": "planner", "purpose": "task"},
+        }]
+        self.assertFalse(pending_review_without_model(
+            previous, comments, "web-s2-b006", 3
         ))
 
 
