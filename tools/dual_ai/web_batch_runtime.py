@@ -45,6 +45,7 @@ FORMAT = (
 
 
 GENERATED_REVIEW_FILES = frozenset({"frontend/package-lock.json"})
+MAX_REVIEW_SOURCE_BYTES = 32 * 1024
 
 
 def generated_review_summary(path: str, content: str) -> dict | None:
@@ -262,7 +263,9 @@ class WebBatch:
             check_scope([path], self.plan)
         except HumanRequired:
             return False
-        return path in GENERATED_REVIEW_FILES
+        # Recovery never publishes blindly: it revalidates the exact pushed commit,
+        # reruns fixed tests, and calls snapshot() again under the current limits.
+        return True
 
     def enter_resume_verified_development(self):
         """Resume only after a verified, pushed development commit and snapshot-scope pause.
@@ -281,10 +284,16 @@ class WebBatch:
                 or previous.get("phase") != "needs_human"
                 or previous.get("action") != "development"
                 or not self._verified_development_pause_allowed(previous.get("question"))
-                or number != 1 or previous.get("rounds_completed") != 0
+                or type(number) is not int or not 1 <= number <= 3
+                or previous.get("rounds_completed") != number - 1
                 or previous.get("verified_development_recovery_attempts", 0) != 0
-                or previous.get("last_phase") is not None
-                or previous.get("last_report_id") is not None
+                or (number == 1 and (
+                    previous.get("last_phase") is not None
+                    or previous.get("last_report_id") is not None))
+                or (number > 1 and (
+                    previous.get("last_phase") != "repair"
+                    or type(previous.get("last_report_id")) is not int
+                    or previous.get("last_report_id") <= 0))
                 or previous.get("branch") != self.branch
                 or type(previous.get("issue")) is not int):
             raise HumanRequired("暂停点不是获准的首轮已提交开发恢复点。")
@@ -321,7 +330,7 @@ class WebBatch:
         comments = self.api("issues/" + str(self.issue) + "/comments?per_page=100")
         if not isinstance(comments, list) or len(comments) >= 100:
             raise HumanRequired("无法完整核对 GitHub 交接记录。")
-        prefix = "<!-- web-batch=" + self.batch_id + " round=1 phase="
+        prefix = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase="
         if (sum(prefix + "development_started -->" in str(x.get("body", ""))
                 for x in comments if isinstance(x, dict)) != 1
                 or any(prefix + p + " -->" in str(x.get("body", ""))
@@ -330,12 +339,18 @@ class WebBatch:
                                  "repair_started", "repair", "round_complete",
                                  "resume_verified_development"))):
             raise HumanRequired("开发报告或评审可能已经投递，禁止再次发送。")
-        response_file = DATA / self.batch_id / "response-1-development.json"
+        for completed in range(1, number):
+            marker = ("<!-- web-batch=" + self.batch_id + " round="
+                      + str(completed) + " phase=round_complete -->")
+            if sum(marker in str(x.get("body", ""))
+                   for x in comments if isinstance(x, dict)) != 1:
+                raise HumanRequired("前序轮次完成记录不唯一，禁止恢复。")
+        response_file = DATA / self.batch_id / ("response-" + str(number) + "-development.json")
         if not response_file.is_file():
             raise HumanRequired("原 DeepSeek 回复文件不存在。")
         recorded = json.loads(response_file.read_text(encoding="utf-8"))
         saved_text = recorded.get("text")
-        if (recorded.get("role") != "executor" or recorded.get("round") != 1
+        if (recorded.get("role") != "executor" or recorded.get("round") != number
                 or recorded.get("phase") != "development"
                 or not isinstance(saved_text, str) or not saved_text):
             raise HumanRequired("原始 DeepSeek 回复记录不完整。")
@@ -347,7 +362,7 @@ class WebBatch:
         if self.sessions.session_ids != previous.get("sessions"):
             raise HumanRequired("可见模型会话发生变化，禁止替换已完成的模型调用。")
         events = [event for event in previous.get("context_events", [])
-                  if event.get("round") == 1 and event.get("phase") == "model_usage"
+                  if event.get("round") == number and event.get("phase") == "model_usage"
                   and event.get("data", {}).get("role") == "executor"
                   and event.get("data", {}).get("purpose", "task") == "task"]
         if len(events) != 1:
@@ -379,11 +394,11 @@ class WebBatch:
         source = self.snapshot(True)
         source_hash = hashlib.sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         self.state = previous
-        report = {"batch_id": self.batch_id, "round": 1, "phase": "development",
+        report = {"batch_id": self.batch_id, "round": number, "phase": "development",
                   "time": now(), "head_sha": head, "pr": self.pr,
                   "model_result": parsed, "model_report": saved_text,
                   "verification": verification,
-                  "format_recovery": previous.get("format_recoveries", {}).get("1-development"),
+                  "format_recovery": previous.get("format_recoveries", {}).get(str(number) + "-development"),
                   "source": source, "source_hash": source_hash}
         self.local_checkpoint("resuming_verified_development", {
             "pr": self.pr, "verified_development_recovery_attempts": 1,
@@ -391,8 +406,8 @@ class WebBatch:
             "resume_source": "original_saved_and_bound_tui_development"})
         self.recovered_capture = report
         self.replay_refused = False
-        print("恢复原 Issue #" + str(self.issue) +
-              "：复用第1轮已提交开发及原 DeepSeek 回复，从 GitHub 开发报告继续，未重跑开发。", flush=True)
+        print("恢复原 Issue #" + str(self.issue) + "：复用第" + str(number)
+              + "轮已提交开发及原 DeepSeek 回复，从 GitHub 开发报告继续，未重跑开发。", flush=True)
         return self
 
     def enter_resume(self):
@@ -801,7 +816,11 @@ class WebBatch:
         # Only changed files are constrained by the approved edit scope.
         # These three unmodified reference files are read-only review context.
         check_scope(changed, self.plan)
-        paths = sorted(set(changed + ["frontend/src/App.tsx", "frontend/src/fileFilter.ts", "backend/main.py"]))
+        references = ["backend/main.py"]
+        if (any(root.startswith("frontend/") for root in self.plan["allowed_roots"])
+                or any(path.startswith("frontend/") for path in self.plan["allowed_files"])):
+            references.extend(["frontend/src/App.tsx", "frontend/src/fileFilter.ts"])
+        paths = sorted(set(changed + references))
         sources = {}
         for path in paths:
             local = ROOT / path
@@ -825,7 +844,7 @@ class WebBatch:
                     **({"sha": data.get("sha")} if data else {"uncommitted": True}),
                     "generated_summary": generated,
                 }
-            elif len(published.encode("utf-8")) > 18000:
+            elif len(published.encode("utf-8")) > MAX_REVIEW_SOURCE_BYTES:
                 raise HumanRequired("源码文件超出本批逐文件审查预算：" + path)
             elif verified:
                 sources[path] = {"sha": data.get("sha"), "content": published}
