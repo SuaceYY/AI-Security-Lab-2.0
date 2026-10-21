@@ -96,6 +96,8 @@ class BatchContractTests(unittest.TestCase):
 
     def test_snapshot_reference_backend_is_readonly_context_not_edit_scope(self):
         plan = copy.deepcopy(PLAN)
+        plan["allowed_roots"] = ["frontend/src/", "frontend/tests/"]
+        plan["allowed_files"] = []
         plan["allowed_suffixes"] = [".ts", ".tsx"]
         batch = web_batch_runtime.WebBatch.__new__(web_batch_runtime.WebBatch)
         batch.plan = plan
@@ -141,6 +143,16 @@ class BatchContractTests(unittest.TestCase):
                 validate_plan(plan)
 
     def test_scope_blocks_traversal_protected_paths_and_dependencies(self):
+        scope_plan = copy.deepcopy(PLAN)
+        scope_plan["allowed_roots"] = [
+            "frontend/src/",
+            "frontend/tests/",
+            "backend/",
+        ]
+        scope_plan["allowed_files"] = [
+            "frontend/package.json",
+            "frontend/package-lock.json",
+        ]
         check_scope(
             [
                 "backend/tests/test_scan.py",
@@ -148,13 +160,13 @@ class BatchContractTests(unittest.TestCase):
                 "frontend/package.json",
                 "frontend/package-lock.json",
             ],
-            PLAN,
+            scope_plan,
         )
         for path in ("backend/../tools/x.py", "tools/x.py", "frontend/tsconfig.json",
                      "backend/.env", "backend/node_modules/x.js", "/backend/x.py",
                      "backend\\x.py"):
             with self.subTest(path=path), self.assertRaises(HumanRequired):
-                check_scope([path], PLAN)
+                check_scope([path], scope_plan)
 
     def test_explicit_resume_starts_with_review_of_existing_report(self):
         bridge = Bridge()
