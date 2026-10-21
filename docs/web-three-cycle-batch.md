@@ -97,7 +97,7 @@ python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --resume-completed-revi
 
 此入口只接受：原计数保留、本轮已发布开发报告且验证通过、唯一review_started、尚无review发布或repair_started、原Issue/PR/本地与远端提交和源码摘要一致、原绑定会话空闲、可唯一定位并GET原GLM消息及模型来源。每批最多一次。不会重新发送审查任务。将原意见发布GitHub后重新读取，交给DeepSeek完成当轮整改/核对，再按原三轮上限停止。无第四轮、自动合并或重置状态。
 
-Issue #33 在提交4975de7a的第三轮开发与固定验证已通过；已完整完成两轮，第三轮旧GLM回复格式待恢复。只有最后整改报告发布及round_complete后才计满三轮，不能把屏幕出现pass当作批次完成。
+Issue #33 后续已完成三轮并人工合并 PR #34；该段的恢复命令只记录当时的暂停操作，不适用于后续批次。
 
 
 ## 免费服务拒绝无工具整理请求的兼容性续接
@@ -113,6 +113,10 @@ python -m tools.dual_ai.web_batch --batch-id web-s1-b001 --resume-format-compati
 
 ## 批次 web-s1-b003：后端请求体字节上限
 
-前两批网页阶段一静态扫描闭环及前端成功响应校验分别随产品 PR #34、#36 人工合并。当前计划以工具仓库 `tools/dual_ai/web_batch_plan.json` revision 3 为准，仅围绕 `POST /scans` 的 8 MiB 原始 HTTP 请求体上限安排三轮后端开发、审查和整改；开发尽量局限 `backend/main.py` 与 `backend/tests/test_scan_api.py`。没有 Content-Length 的流和低报头同样计数，返回 413 前不进行 JSON 解析或扫描。已有 5 MiB 解码文本上限保持。Finding 数量上限和浏览器验收后续独立安排。
+前两批网页阶段一静态扫描闭环及前端成功响应校验分别随产品 PR #34、#36 人工合并。该批执行时以工具仓库 `tools/dual_ai/web_batch_plan.json` revision 3 为准，仅围绕 `POST /scans` 的 8 MiB 原始 HTTP 请求体上限安排三轮后端开发、审查和整改；开发尽量局限 `backend/main.py` 与 `backend/tests/test_scan_api.py`。没有 Content-Length 的流和低报头同样计数，返回 413 前不进行 JSON 解析或扫描。已有 5 MiB 解码文本上限保持。Finding 数量上限和浏览器验收后续独立安排。
 
 每三轮结束后，主审独立核对最终源码、报告和验证，修正已证实的问题；**在提供下批启动指令之前**先汇报相对于原产品大纲的总体进度。批次启动只沿用当前两扇真实 OpenCode TUI，不自动合并，不重复已合并任务。下批使用新的 `web-s1-b003` 标识，不复用已完成 `web-s1-b001` 或 `web-s1-b002`。
+
+## 批次 web-s1-b004：Finding 输出资源上限
+
+PR #38 的请求体限额及主审分块缓冲修补已经人工合并，main=bb6b91b264edf2bb45312a52569244c43068f270。现行计划 revision 4 限制扫描结果：每次最多 1000 条 Finding、成功响应 JSON 最大 2 MiB，超限返回明确的 413；三轮分别实现条数上限、字节预算和边界回归。尽量只改 `backend/static_scan.py`、`backend/scan_service.py`、`backend/tests/test_finding_limits.py`，不重做前端/API、扩大规则或执行被扫描代码。新批次标识 `web-s1-b004`，三个完整的开发→GitHub 报告→GLM 审查→DeepSeek 整改循环结束即停，主审先汇报总体进度再提供下批指令，合并仍由用户批准。

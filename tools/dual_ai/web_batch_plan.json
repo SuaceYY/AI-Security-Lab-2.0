@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "revision": 3,
-  "title": "网页阶段一加固：扫描请求体解析前字节上限",
-  "roadmap": "沿用已合并 PR #34 的网页静态扫描闭环及 PR #36 的成功响应深层校验。这一批只加固 POST /scans 的请求体资源边界；Finding 数量/响应体限制与真实浏览器验收留给后续独立小批次。产品其后按既定大纲推进本地 AI、证据独立核验与误报控制、报告交付以及稳定性成本优化。",
-  "goal": "在现有 FastAPI API 上为 POST /scans 加 8 MiB 原始 HTTP 请求体字节上限，超限在 JSON 解析和扫描前返回统一 failed/request_too_large/HTTP 413。长度检查必须覆盖无 Content-Length、分块及不可信低报头，合法请求和 /health 保持原样；已有解码文本总量 5 MiB 限额不变。不安装依赖，不扩大到 Finding 数量限制、队列、AI 或其他功能。每轮仅允许后端 API 和其测试的最小改动；三轮开发→报告→GLM 审查→DeepSeek 整改后停止，需人工独立核验与批准才可合并。",
+  "revision": 4,
+  "title": "网页阶段一加固：限制 Finding 数量与扫描响应体积",
+  "roadmap": "沿用已合并的网页静态扫描、前端深层校验及请求体限额。此批只补扫描结果输出资源边界，后续分别安排真实浏览器验收与原大纲中的本地 AI、独立证据核验、报告交付、稳定性和成本控制。",
+  "goal": "对用户主动提交的本地代码，服务端在生成结果时限制每次扫描最多 1000 条 Finding，并限制整个成功响应的序列化 JSON 不超过 2 MiB；超出时明确返回 HTTP 413、status=failed 及稳定错误码，不截断伪造完整扫描。预算计算须覆盖重复路径、文件状态、统计数据与 Findings，不因碎行或长文件名产生巨量响应。三轮复用当前两个真实 OpenCode TUI，在 GitHub 交接和核验后停止，人工主审及批准后才合并。仅涉及扫描器、服务及其最小测试，不新增依赖，不执行被扫描代码。",
   "allowed_roots": [
     "frontend/src/",
     "frontend/tests/",
@@ -13,8 +13,8 @@
     ".py"
   ],
   "round_focus": [
-    "第一轮：仅修改 backend/main.py 和 backend/tests/test_scan_api.py；对 POST /scans 增加最大 8 MiB 原始 HTTP body 字节的 ASGI 接入层防护，在 FastAPI/Pydantic JSON 解析之前拦截，统一返回 413 且 detail={status:'failed',code:'request_too_large',message:可读文本}。Content-Length 可提前拒绝，但必须通过实际接收字节计数作最终判断；不截断请求冒充成功、不执行超限扫描，正常请求的接收语义与原有响应保持一致。最少复现超限 JSON 未进入扫描、正常请求仍完成；不要改前端/扫描规则/依赖。",
-    "第二轮：仅在同两份文件里验证无 Content-Length、分块发送和 Content-Length 小于真实 body 的情况；用最小的原生 ASGI receive 测试真实多块字节计数与早拒绝（不能只测预报头）。有失败才修复实现；固定验证前后端现有测试、build、lint。汇报精确状态和证据，避免把无测试覆盖说成通过。",
-    "第三轮：同两份文件内补请求体边界和回归收尾：验证恰好 8 MiB 原始合法 JSON（可用空白填充、解码文本仍低于 5 MiB）被允许，8 MiB+1 被拒绝；含多字节 UTF-8 依据实际字节计数；GET /health 和现有 5 MiB 解码文本限制仍有效。若无真实问题只补必要测试或核对，保持两文件范围。第三轮评审和整改记录齐全后自动停止，不自动合并、不启动第四轮。"
+    "第一轮：只在 backend/static_scan.py、backend/scan_service.py、新建 backend/tests/test_finding_limits.py 内实现每次扫描最多 1000 条 Finding。支持跨文件累计，在生成第 1001 条时及时拒绝，返回 HTTP 413 且 detail.status=failed、code=too_many_findings；恰好 1000 条正常完成并保持统计一致。不可先生成海量 Findings 再截断，保留已有正常输入和文件过滤行为。",
+    "第二轮：仍限上述三文件，加入成功响应最大 2 MiB JSON 字节预算，累计计算文件状态、摘要、Finding及重复路径；临界前校验，不构造无界重复路径或海量输出。超限返回 HTTP 413、code=scan_output_too_large；验证长路径即使 Finding 较少也被拒绝，且超限不返回 status=done。不要修改前端或请求体 8 MiB 限制。",
+    "第三轮：仅在三文件范围内补计数/字节恰好边界、多文件、零 Finding、跳过文件及 UTF-8 输入回归；有真实缺陷才改实现。运行后端全部测试、前端原有测试、build、lint，逐项发布命令与真实输出。GLM 审查及 DeepSeek 整改完成后自动停止，不合并、不启动第四轮；若发现必须超范围修改，暂停询问用户。"
   ]
 }
