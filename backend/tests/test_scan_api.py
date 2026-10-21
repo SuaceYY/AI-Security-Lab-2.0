@@ -3,6 +3,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -127,6 +128,32 @@ class ScanEndpointTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["scanned_count"], 1)
         self.assertEqual(payload["summary"]["finding_count"], 0)
         self.assertEqual(payload["findings"], [])
+
+    def test_request_body_over_limit_is_rejected_before_scan(self):
+        request_payload = {
+            "files": [
+                scan_file(
+                    "src/large.py",
+                    "a" * (main.MAX_SCAN_REQUEST_BODY_BYTES + 1),
+                )
+            ]
+        }
+
+        with patch.object(main, "run_scan") as run_scan:
+            status, payload = request("POST", "/scans", request_payload)
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            payload,
+            {
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": main.REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        run_scan.assert_not_called()
 
     def test_empty_file_list_is_rejected(self):
         status, payload = scan([])

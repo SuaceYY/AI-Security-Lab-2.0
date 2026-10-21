@@ -5,13 +5,92 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
     from .scan_service import ScanValidationError, run_scan
 except ImportError:
     from scan_service import ScanValidationError, run_scan  # type: ignore[no-redef]
 
+MAX_SCAN_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+REQUEST_TOO_LARGE_MESSAGE = "请求体过大，最大允许 8 MiB。"
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/scans"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        if self._content_length_exceeds_limit(scope):
+            await self._send_too_large(scope, receive, send)
+            return
+
+        messages: list[Message] = []
+        received_bytes = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+
+            received_bytes += len(message.get("body", b""))
+            if received_bytes > MAX_SCAN_REQUEST_BODY_BYTES:
+                await self._send_too_large(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        message_index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal message_index
+            if message_index < len(messages):
+                message = messages[message_index]
+                message_index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    def _content_length_exceeds_limit(scope: Scope) -> bool:
+        for name, value in scope.get("headers", []):
+            if name.lower() != b"content-length":
+                continue
+            try:
+                return int(value) > MAX_SCAN_REQUEST_BODY_BYTES
+            except ValueError:
+                return False
+        return False
+
+    async def _send_too_large(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        await response(scope, receive, send)
+
+
 app = FastAPI(title="AI-Security-Lab 2.0", version="0.1.0")
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
 @app.exception_handler(RequestValidationError)
