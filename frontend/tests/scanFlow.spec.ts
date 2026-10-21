@@ -10,6 +10,9 @@ const FINDING_CONTENT = 'value = eval(user_input)\n'
 const MIXED_ALLOWED_CONTENT = 'const allowed = true\n'
 const SENSITIVE_ENV_CONTENT = 'SECRET_TOKEN=e2e-sensitive-sentinel\n'
 const UNSUPPORTED_CONTENT = 'e2e-unsupported-sentinel\n'
+const UTF8_FILE_PATH = 'src/中文模块.py'
+const UTF8_CONTENT = '结果 = "用户输入"\nvalue = eval(结果)\n'
+const UTF8_EVIDENCE = 'value = eval(用户输入)'
 
 const SCAN_FAILURE_CASES = [
   {
@@ -65,12 +68,42 @@ async function createFixture(files: Record<string, string>): Promise<string> {
   return fixtureDir
 }
 
-async function mockHealth(page: Page): Promise<void> {
+function createGate(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => {}
+  const promise = new Promise<void>(resolve => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
+function zeroFindingResponse(filePath: string) {
+  return {
+    task_id: 'e2e-zero-findings',
+    status: 'done',
+    summary: {
+      file_count: 1,
+      scanned_count: 1,
+      skipped_count: 0,
+      finding_count: 0,
+    },
+    files: [
+      {
+        file_path: filePath,
+        status: 'scanned',
+        finding_count: 0,
+        reason: null,
+      },
+    ],
+    findings: [],
+  }
+}
+
+async function mockHealth(page: Page, status = 'ok'): Promise<void> {
   await page.route('**/api/health', async route => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ status: 'ok' }),
+      body: JSON.stringify({ status }),
     })
   })
 }
@@ -265,3 +298,151 @@ for (const failure of SCAN_FAILURE_CASES) {
     })
   })
 }
+
+test('健康检查返回非 ok 时显示后端状态异常', async ({ page }) => {
+  await mockHealth(page, 'degraded')
+  await page.goto(baseURL)
+
+  await expect(page.getByText('系统状态：后端状态异常')).toBeVisible()
+})
+
+test('扫描按钮在请求期间禁用并在完成后恢复可用', async ({ page }) => {
+  const fixture = await createFixture({
+    'src/safe.py': 'print("safe")\n',
+  })
+  const filePath = `${basename(fixture)}/src/safe.py`
+  const expectedRequest = {
+    files: [{ file_path: filePath, content: 'print("safe")\n' }],
+  }
+
+  let requestCount = 0
+  let scanRequestBody: unknown
+  let gate = createGate()
+
+  await mockHealth(page)
+  await page.route('**/api/scans', async route => {
+    requestCount += 1
+    scanRequestBody = route.request().postDataJSON()
+    await gate.promise
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(zeroFindingResponse(filePath)),
+    })
+  })
+  await page.goto(baseURL)
+
+  await page.locator('input[type="file"]').setInputFiles(fixture)
+  await expect(page.getByText('允许文件数量：1')).toBeVisible()
+  await page.getByRole('button', { name: '开始静态扫描' }).click()
+
+  await expect(page.getByRole('button', { name: '扫描中...' })).toBeDisabled()
+  await expect(page.getByText('正在提交并扫描允许文件...')).toBeVisible()
+  await expect.poll(() => requestCount).toBe(1)
+
+  gate.release()
+  await expect(page.getByText('任务状态：已完成（done）')).toBeVisible()
+  await expect(page.getByRole('button', { name: '开始静态扫描' })).toBeEnabled()
+
+  gate = createGate()
+  await page.getByRole('button', { name: '开始静态扫描' }).click()
+  await expect(page.getByRole('button', { name: '扫描中...' })).toBeDisabled()
+  await expect(page.getByText('任务状态：已完成（done）')).toHaveCount(0)
+  await expect.poll(() => requestCount).toBe(2)
+
+  gate.release()
+  await expect(page.getByText('任务状态：已完成（done）')).toBeVisible()
+  await expect(page.getByRole('button', { name: '开始静态扫描' })).toBeEnabled()
+  expect(scanRequestBody).toEqual(expectedRequest)
+})
+
+test('零 Finding 成功结果提示未发现静态规则', async ({ page }) => {
+  const fixture = await createFixture({
+    'src/safe.py': 'print("safe")\n',
+  })
+  const filePath = `${basename(fixture)}/src/safe.py`
+
+  let scanRequestBody: unknown
+
+  await mockHealth(page)
+  await mockScanRoute(page, body => {
+    scanRequestBody = body
+    return { status: 200, body: zeroFindingResponse(filePath) }
+  })
+  await page.goto(baseURL)
+
+  await page.locator('input[type="file"]').setInputFiles(fixture)
+  await expect(page.getByText('允许文件数量：1')).toBeVisible()
+  await page.getByRole('button', { name: '开始静态扫描' }).click()
+
+  await expect(page.getByText('任务状态：已完成（done）')).toBeVisible()
+  await expect(page.getByText('扫描完成，未发现匹配的静态规则。')).toBeVisible()
+  await expect(page.getByText('未发现匹配的静态规则。', { exact: true })).toBeVisible()
+  await expect(page.getByText(/问题数：\s*0/)).toBeVisible()
+  expect(scanRequestBody).toEqual({
+    files: [{ file_path: filePath, content: 'print("safe")\n' }],
+  })
+})
+
+test('UTF-8 路径与证据在页面和请求中正确渲染', async ({ page }) => {
+  const fixture = await createFixture({
+    [UTF8_FILE_PATH]: UTF8_CONTENT,
+  })
+  const filePath = `${basename(fixture)}/${UTF8_FILE_PATH}`
+
+  let scanRequestBody: unknown
+
+  await mockHealth(page)
+  await mockScanRoute(page, body => {
+    scanRequestBody = body
+    return {
+      status: 200,
+      body: {
+        task_id: 'e2e-utf8',
+        status: 'done',
+        summary: {
+          file_count: 1,
+          scanned_count: 1,
+          skipped_count: 0,
+          finding_count: 1,
+        },
+        files: [
+          {
+            file_path: filePath,
+            status: 'scanned',
+            finding_count: 1,
+            reason: null,
+          },
+        ],
+        findings: [
+          {
+            rule_id: 'PY-EVAL-EXEC',
+            severity: 'high',
+            file_path: filePath,
+            line: 2,
+            evidence: UTF8_EVIDENCE,
+            explanation: '检测到动态执行字符串的调用模式。',
+            recommendation: '避免使用 eval，改用显式解析。',
+          },
+        ],
+      },
+    }
+  })
+  await page.goto(baseURL)
+
+  await page.locator('input[type="file"]').setInputFiles(fixture)
+  await expect(page.getByText('允许文件数量：1')).toBeVisible()
+  await page.getByRole('button', { name: '开始静态扫描' }).click()
+
+  await expect(page.getByText('任务状态：已完成（done）')).toBeVisible()
+  await expect(page.getByText(/问题数：\s*1/)).toBeVisible()
+
+  const finding = page.locator('li').filter({ hasText: 'PY-EVAL-EXEC' })
+  await expect(finding).toHaveCount(1)
+  await expect(finding).toContainText(`${filePath}:2`)
+  await expect(finding).toContainText(`证据：${UTF8_EVIDENCE}`)
+
+  expect(scanRequestBody).toEqual({
+    files: [{ file_path: filePath, content: UTF8_CONTENT }],
+  })
+})
