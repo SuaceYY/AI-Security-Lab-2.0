@@ -140,6 +140,30 @@ def review_prompt_manifest(report: dict) -> dict:
     }
 
 
+def pending_review_without_model(previous: dict, comments: list, batch_id: str,
+                                 number: int) -> bool:
+    marker = ("<!-- web-batch=" + batch_id + " round=" + str(number)
+              + " phase=review_started -->")
+    review_started = sum(marker in c.get("body", "")
+                         for c in comments if isinstance(c, dict))
+    prefix = "<!-- web-batch=" + batch_id + " round=" + str(number) + " phase="
+    model_events = [
+        event for event in previous.get("context_events", [])
+        if event.get("round") == number and event.get("phase") == "model_usage"
+        and event.get("data", {}).get("role") == "planner"
+        and event.get("data", {}).get("purpose", "task") == "task"
+    ]
+    return (
+        review_started == 1
+        and previous.get("action") == "review"
+        and previous.get("question") == "单次任务超过上下文安全预算，请人工缩小任务。"
+        and not model_events
+        and not any(prefix + phase + " -->" in c.get("body", "")
+                    for c in comments if isinstance(c, dict)
+                    for phase in ("review", "repair_started", "repair", "round_complete"))
+    )
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -500,21 +524,8 @@ class WebBatch:
         marker = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase=review_started -->"
         review_started = sum(marker in c.get("body", "")
                              for c in comments if isinstance(c, dict))
-        prefix = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase="
-        current_model_events = [
-            event for event in previous.get("context_events", [])
-            if event.get("round") == number and event.get("phase") == "model_usage"
-            and event.get("data", {}).get("role") == "planner"
-            and event.get("data", {}).get("purpose", "task") == "task"
-        ]
-        pending_review = (
-            review_started == 1
-            and previous.get("action") == "review"
-            and previous.get("question") == "单次任务超过上下文安全预算，请人工缩小任务。"
-            and not current_model_events
-            and not any(prefix + phase + " -->" in c.get("body", "")
-                        for c in comments if isinstance(c, dict)
-                        for phase in ("review", "repair_started", "repair", "round_complete"))
+        pending_review = pending_review_without_model(
+            previous, comments, self.batch_id, number
         )
         if review_started and not pending_review:
             raise HumanRequired("GLM 可能已接收本轮任务，禁止自动重复投递。")
