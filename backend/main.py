@@ -8,12 +8,15 @@ from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
+    from .local_ai import LocalAIError, analyze_findings
     from .scan_service import ScanValidationError, run_scan
 except ImportError:
+    from local_ai import LocalAIError, analyze_findings  # type: ignore[no-redef]
     from scan_service import ScanValidationError, run_scan  # type: ignore[no-redef]
 
 MAX_SCAN_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 REQUEST_TOO_LARGE_MESSAGE = "请求体过大，最大允许 8 MiB。"
+LIMITED_REQUEST_PATHS = frozenset({"/scans", "/analyses"})
 
 
 class RequestBodyLimitMiddleware:
@@ -24,7 +27,7 @@ class RequestBodyLimitMiddleware:
         if not (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") == "/scans"
+            and scope.get("path") in LIMITED_REQUEST_PATHS
         ):
             await self.app(scope, receive, send)
             return
@@ -165,6 +168,25 @@ class ScanResponse(BaseModel):
     findings: list[FindingModel]
 
 
+class AnalysisRequest(BaseModel):
+    findings: list[FindingModel]
+
+
+class FindingPriorityResponse(BaseModel):
+    finding_index: int
+    priority: Literal["critical", "high", "medium", "low"]
+    reason: str
+
+
+class AnalysisResponse(BaseModel):
+    status: Literal["done"]
+    model: str
+    total_count: int
+    analyzed_count: int
+    summary: str
+    priorities: list[FindingPriorityResponse]
+
+
 @app.get("/")
 def home():
     return {"message": "AI-Security-Lab 2.0 API is running"}
@@ -182,6 +204,25 @@ def create_scan(payload: ScanRequest):
             (item.file_path, item.content) for item in payload.files
         )
     except ScanValidationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "status": "failed",
+                "code": exc.code,
+                "message": exc.message,
+            },
+        ) from exc
+
+    return result.to_dict()
+
+
+@app.post("/analyses", response_model=AnalysisResponse)
+def create_analysis(payload: AnalysisRequest):
+    try:
+        result = analyze_findings(
+            item.model_dump() for item in payload.findings
+        )
+    except LocalAIError as exc:
         raise HTTPException(
             status_code=exc.status_code,
             detail={
