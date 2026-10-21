@@ -1,0 +1,58 @@
+name: Dual AI Python CI
+
+on:
+  pull_request:
+    branches: [main, feature/dual-ai-github-loop-bootstrap]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/dual-ai-python-ci.yml'
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  unit-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.15']
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile Python sources
+        run: python -m compileall -q tools
+      - name: Dual AI contract tests without model calls
+        run: python -m unittest discover -s tools/dual_ai -p 'test_*.py' -v
+      - name: Existing worker safety tests
+        run: python -m unittest discover -s tools/issue_claimer/tests -p 'test_*.py' -v
+      - name: Existing worker regression tests
+        run: python -m unittest discover -s tools/issue_claimer -p 'test_claimer_regression.py' -v
+      - name: Read the actual paused report through GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          from tools.dual_ai.web_batch_runtime import WebBatch
+          plan = json.loads(Path("tools/dual_ai/web_batch_plan.json").read_text(encoding="utf-8"))
+          batch = WebBatch("web-s1-b001", plan)
+          batch.issue = 33
+          report = batch.fetch(6298174688)
+          assert report["head_sha"] == "760d01e6368ce1d5254f73e053f7d4ba4fb31288"
+          digest = hashlib.sha256(json.dumps(report["source"], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+          assert digest == report["source_hash"] == "cf8de7e6e28a3a86b59fb4bcb34c42d98694474d30cf7a13698533fb5578d36a"
+          assert report["verification"]["ok"] is True
+          print("Actual GitHub report and source hash verified; no model calls or batch writes.")
+          PY
