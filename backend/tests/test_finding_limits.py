@@ -11,7 +11,12 @@ if str(BACKEND_DIR) not in sys.path:
 
 import main  # noqa: E402
 import static_scan  # noqa: E402
-from scan_service import MAX_FINDINGS, ScanValidationError, run_scan  # noqa: E402
+from scan_service import (  # noqa: E402
+    MAX_FINDINGS,
+    MAX_SCAN_RESPONSE_BYTES,
+    ScanValidationError,
+    run_scan,
+)
 from static_scan import FindingLimitExceeded, scan_text  # noqa: E402
 
 FINDING_LINE = "eval(user_input)\n"
@@ -25,7 +30,7 @@ def source_with_findings(count: int) -> str:
     return FINDING_LINE * count
 
 
-def post_scan(files: list[dict]) -> tuple[int, dict]:
+def post_scan(files: list[dict]) -> tuple[int, dict, int]:
     body = json.dumps({"files": files}).encode("utf-8")
     scope = {
         "type": "http",
@@ -69,12 +74,16 @@ def post_scan(files: list[dict]) -> tuple[int, dict]:
         for message in messages
         if message["type"] == "http.response.body"
     )
-    return start["status"], json.loads(response_body.decode("utf-8"))
+    return (
+        start["status"],
+        json.loads(response_body.decode("utf-8")),
+        len(response_body),
+    )
 
 
 class FindingLimitTests(unittest.TestCase):
     def test_exactly_1000_findings_across_files_completes(self):
-        status, payload = post_scan(
+        status, payload, response_length = post_scan(
             [
                 scan_file("src/first.py", source_with_findings(600)),
                 scan_file("src/second.py", source_with_findings(400)),
@@ -82,6 +91,7 @@ class FindingLimitTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
+        self.assertLessEqual(response_length, MAX_SCAN_RESPONSE_BYTES)
         self.assertEqual(payload["status"], "done")
         self.assertEqual(
             payload["summary"],
@@ -99,7 +109,7 @@ class FindingLimitTests(unittest.TestCase):
         self.assertEqual(len(payload["findings"]), MAX_FINDINGS)
 
     def test_1001st_finding_across_files_is_rejected(self):
-        status, payload = post_scan(
+        status, payload, _ = post_scan(
             [
                 scan_file("src/first.py", source_with_findings(600)),
                 scan_file("src/second.py", source_with_findings(401)),
@@ -138,6 +148,33 @@ class FindingLimitTests(unittest.TestCase):
         self.assertEqual(caught.exception.limit, MAX_FINDINGS)
         self.assertIn(f"最多允许 {MAX_FINDINGS} 条", str(caught.exception))
         self.assertEqual(finding_class.call_count, MAX_FINDINGS)
+
+    def test_long_path_with_few_findings_is_rejected_before_scan(self):
+        long_path = "a" * (MAX_SCAN_RESPONSE_BYTES + 1024) + ".py"
+        with patch.object(
+            static_scan, "Finding", wraps=static_scan.Finding
+        ) as finding_class:
+            status, payload, _ = post_scan([scan_file(long_path, FINDING_LINE)])
+
+        self.assertEqual(status, 413)
+        self.assertNotIn("status", payload)
+        self.assertNotIn("findings", payload)
+        self.assertEqual(payload["detail"]["status"], "failed")
+        self.assertEqual(payload["detail"]["code"], "scan_output_too_large")
+        self.assertIn(str(MAX_SCAN_RESPONSE_BYTES), payload["detail"]["message"])
+        self.assertEqual(finding_class.call_count, 0)
+
+    def test_repeated_long_path_findings_are_rejected(self):
+        long_path = "src/" + "a" * 4096 + ".py"
+        status, payload, _ = post_scan(
+            [scan_file(long_path, source_with_findings(1000))]
+        )
+
+        self.assertEqual(status, 413)
+        self.assertNotIn("status", payload)
+        self.assertNotIn("findings", payload)
+        self.assertEqual(payload["detail"]["status"], "failed")
+        self.assertEqual(payload["detail"]["code"], "scan_output_too_large")
 
 
 if __name__ == "__main__":
