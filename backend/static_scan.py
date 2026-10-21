@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Iterator
 
 SUPPORTED_EXTENSIONS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx"})
 SEVERITIES = ("high", "medium", "low", "info")
@@ -56,6 +56,14 @@ class Finding:
             "explanation": self.explanation,
             "recommendation": self.recommendation,
         }
+
+
+class FindingLimitExceeded(ValueError):
+    """表示本次扫描发现的 Finding 数量超过调用方给定上限。"""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"本次调用最多允许 {limit} 条 Finding。")
+        self.limit = limit
 
 
 RULES: tuple[Rule, ...] = (
@@ -109,6 +117,8 @@ RULES: tuple[Rule, ...] = (
     ),
 )
 
+_SORTED_RULES = tuple(sorted(RULES, key=lambda rule: rule.rule_id))
+
 
 def normalize_relative_path(path: str) -> str:
     """规范化相对路径，拒绝绝对路径、上跳路径与 NUL 字符。"""
@@ -152,29 +162,37 @@ def _make_evidence(line: str) -> str:
     return evidence
 
 
-def scan_text(file_path: str, text: str) -> list[Finding]:
-    """扫描单个文本，返回按行号升序排列的 Finding 列表。
+def iter_scan_text(
+    file_path: str,
+    text: str,
+    *,
+    max_findings: int | None = None,
+) -> Iterator[Finding]:
+    """逐个生成 Finding，顺序为行号升序、同一行按 rule_id 升序。
 
-    只支持受支持的代码扩展名；其他扩展名返回空列表。扫描过程不读取
-    外部文件，也不执行 text 中的任何内容。
+    只支持受支持的代码扩展名；其他扩展名不生成结果。扫描过程不读取
+    外部文件，也不执行 text 中的任何内容。给定 max_findings 时，在发现
+    下一条超限 Finding 前抛出 FindingLimitExceeded，不生成超限结果。
     """
     if not isinstance(text, str):
         raise TypeError("text 必须是字符串")
+    if max_findings is not None and max_findings < 0:
+        raise ValueError("max_findings 不能为负数")
 
     normalized_path = normalize_relative_path(file_path)
     extension = _extension_of(normalized_path)
     if extension not in SUPPORTED_EXTENSIONS:
-        return []
+        return
 
-    findings: list[Finding] = []
     seen: set[tuple[str, int]] = set()
+    finding_count = 0
 
     for line_number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or _is_comment_line(stripped):
             continue
 
-        for rule in RULES:
+        for rule in _SORTED_RULES:
             if extension not in rule.extensions:
                 continue
             if not rule.pattern.search(line):
@@ -183,21 +201,29 @@ def scan_text(file_path: str, text: str) -> list[Finding]:
             key = (rule.rule_id, line_number)
             if key in seen:
                 continue
+            if max_findings is not None and finding_count >= max_findings:
+                raise FindingLimitExceeded(max_findings)
             seen.add(key)
-            findings.append(
-                Finding(
-                    rule_id=rule.rule_id,
-                    severity=rule.severity,
-                    file_path=normalized_path,
-                    line=line_number,
-                    evidence=_make_evidence(line),
-                    explanation=rule.explanation,
-                    recommendation=rule.recommendation,
-                )
+            finding_count += 1
+            yield Finding(
+                rule_id=rule.rule_id,
+                severity=rule.severity,
+                file_path=normalized_path,
+                line=line_number,
+                evidence=_make_evidence(line),
+                explanation=rule.explanation,
+                recommendation=rule.recommendation,
             )
 
-    findings.sort(key=lambda finding: (finding.line, finding.rule_id))
-    return findings
+
+def scan_text(
+    file_path: str,
+    text: str,
+    *,
+    max_findings: int | None = None,
+) -> list[Finding]:
+    """扫描单个文本，返回按行号和 rule_id 升序排列的 Finding 列表。"""
+    return list(iter_scan_text(file_path, text, max_findings=max_findings))
 
 
 def scan_files(files: Iterable[tuple[str, str]]) -> list[Finding]:

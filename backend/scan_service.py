@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -16,20 +17,24 @@ try:
     from .static_scan import (
         SUPPORTED_EXTENSIONS,
         Finding,
+        FindingLimitExceeded,
+        iter_scan_text,
         normalize_relative_path,
-        scan_text,
     )
 except ImportError:
     from static_scan import (  # type: ignore[no-redef]
         SUPPORTED_EXTENSIONS,
         Finding,
+        FindingLimitExceeded,
+        iter_scan_text,
         normalize_relative_path,
-        scan_text,
     )
 
 MAX_FILES = 100
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 5 * 1024 * 1024
+MAX_FINDINGS = 1000
+MAX_SCAN_RESPONSE_BYTES = 2 * 1024 * 1024
 
 EXCLUDED_DIRECTORIES = frozenset(
     {
@@ -185,6 +190,61 @@ class ScanResult:
         }
 
 
+_JSON_SEPARATORS = (",", ":")
+
+
+def _json_size(value: object) -> int:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=_JSON_SEPARATORS,
+    )
+    return len(encoded.encode("utf-8"))
+
+
+def _array_json_size(item_sizes: list[int]) -> int:
+    return 2 + sum(item_sizes) + max(0, len(item_sizes) - 1)
+
+
+def _object_json_size(field_sizes: tuple[tuple[str, int], ...]) -> int:
+    return (
+        2
+        + sum(_json_size(name) + 1 + size for name, size in field_sizes)
+        + max(0, len(field_sizes) - 1)
+    )
+
+
+def _serialized_response_size(
+    task_id: str,
+    summary: ScanSummary,
+    file_sizes: list[int],
+    finding_sizes: list[int],
+) -> int:
+    return _object_json_size(
+        (
+            ("task_id", _json_size(task_id)),
+            ("status", _json_size("done")),
+            ("summary", _json_size(summary.to_dict())),
+            ("files", _array_json_size(file_sizes)),
+            ("findings", _array_json_size(finding_sizes)),
+        )
+    )
+
+
+def _make_summary(
+    file_results: list[ScannedFile],
+    findings: list[Finding],
+) -> ScanSummary:
+    scanned_count = sum(1 for item in file_results if item.status == "scanned")
+    return ScanSummary(
+        file_count=len(file_results),
+        scanned_count=scanned_count,
+        skipped_count=len(file_results) - scanned_count,
+        finding_count=len(findings),
+    )
+
+
 def _extension_of(path: str) -> str:
     name = path.rsplit("/", 1)[-1]
     dot_index = name.rfind(".")
@@ -319,55 +379,91 @@ def run_scan(
     """
 
     prepared = _prepare_files(list(files))
+    resolved_task_id = task_id or uuid.uuid4().hex
     file_results: list[ScannedFile] = []
     findings: list[Finding] = []
+    file_sizes: list[int] = []
+    finding_sizes: list[int] = []
+
+    def ensure_budget() -> None:
+        size = _serialized_response_size(
+            resolved_task_id,
+            _make_summary(file_results, findings),
+            file_sizes,
+            finding_sizes,
+        )
+        if size > MAX_SCAN_RESPONSE_BYTES:
+            raise ScanValidationError(
+                "scan_output_too_large",
+                f"扫描响应超过上限 {MAX_SCAN_RESPONSE_BYTES} 字节。",
+                status_code=413,
+            )
 
     for file_path, content in prepared:
         excluded_reason = _excluded_directory_reason(file_path)
         if excluded_reason:
-            file_results.append(
-                ScannedFile(
-                    file_path=file_path,
-                    status="skipped",
-                    finding_count=0,
-                    reason=excluded_reason,
-                )
+            item = ScannedFile(
+                file_path=file_path,
+                status="skipped",
+                finding_count=0,
+                reason=excluded_reason,
             )
+            file_results.append(item)
+            file_sizes.append(_json_size(item.to_dict()))
+            ensure_budget()
             continue
 
         if _extension_of(file_path) not in SUPPORTED_EXTENSIONS:
-            file_results.append(
-                ScannedFile(
-                    file_path=file_path,
-                    status="skipped",
-                    finding_count=0,
-                    reason="不支持的文件类型",
-                )
+            item = ScannedFile(
+                file_path=file_path,
+                status="skipped",
+                finding_count=0,
+                reason="不支持的文件类型",
             )
+            file_results.append(item)
+            file_sizes.append(_json_size(item.to_dict()))
+            ensure_budget()
             continue
 
-        file_findings = scan_text(file_path, content)
-        findings.extend(file_findings)
-        file_results.append(
-            ScannedFile(
-                file_path=file_path,
-                status="scanned",
-                finding_count=len(file_findings),
-            )
+        placeholder = ScannedFile(
+            file_path=file_path,
+            status="scanned",
+            finding_count=0,
         )
+        file_results.append(placeholder)
+        file_sizes.append(_json_size(placeholder.to_dict()))
+        ensure_budget()
 
-    scanned_count = sum(1 for item in file_results if item.status == "scanned")
-    summary = ScanSummary(
-        file_count=len(file_results),
-        scanned_count=scanned_count,
-        skipped_count=len(file_results) - scanned_count,
-        finding_count=len(findings),
-    )
+        first_finding = len(findings)
+        try:
+            for finding in iter_scan_text(
+                file_path,
+                content,
+                max_findings=MAX_FINDINGS - len(findings),
+            ):
+                findings.append(finding)
+                finding_sizes.append(_json_size(finding.to_dict()))
+                ensure_budget()
+        except FindingLimitExceeded as exc:
+            raise ScanValidationError(
+                "too_many_findings",
+                f"扫描结果 Finding 数量超过上限 {MAX_FINDINGS}。",
+                status_code=413,
+            ) from exc
+
+        item = ScannedFile(
+            file_path=file_path,
+            status="scanned",
+            finding_count=len(findings) - first_finding,
+        )
+        file_results[-1] = item
+        file_sizes[-1] = _json_size(item.to_dict())
+        ensure_budget()
 
     return ScanResult(
-        task_id=task_id or uuid.uuid4().hex,
+        task_id=resolved_task_id,
         status="done",
-        summary=summary,
+        summary=_make_summary(file_results, findings),
         files=tuple(file_results),
         findings=tuple(findings),
     )
