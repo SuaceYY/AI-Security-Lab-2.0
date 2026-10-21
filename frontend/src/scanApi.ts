@@ -61,6 +61,8 @@ const SCAN_ERROR_MESSAGES: Record<string, string> = {
   too_many_files: '文件数量超过服务端上限，请减少文件后重试。',
   file_too_large: '存在超过单文件大小上限的文件，请减少文件后重试。',
   total_size_too_large: '提交文本总量超过服务端上限，请减少文件后重试。',
+  too_many_findings: '扫描结果数量超过服务端上限，请减少文件后重试。',
+  scan_output_too_large: '扫描结果体积超过服务端上限，请减少文件后重试。',
   invalid_file_path: '文件路径不合法，服务端已拒绝请求。',
   sensitive_file: '文件包含敏感路径或凭据，服务端已拒绝请求。',
   duplicate_file_path: '提交的文件路径重复，请重新选择。',
