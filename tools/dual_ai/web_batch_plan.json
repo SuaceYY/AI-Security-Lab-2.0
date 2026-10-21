@@ -6,7 +6,8 @@
   "goal": "在 Windows 已安装的 Microsoft Edge 中使用 Playwright 驱动真实网页，验证选择本地代码文件、前端排除敏感或不支持文件、只提交允许文件、展示统一 Finding 和可读错误的完整用户流程。测试使用浏览器级 API 路由替身以保持确定性，不访问外网、不执行所选代码；仅增加轻量测试依赖，不下载额外浏览器。三轮继续复用现有两个真实 OpenCode TUI，通过 GitHub 交接，第三轮整改后自动停止，人工主审后才合并。",
   "allowed_roots": [
     "frontend/src/",
-    "frontend/tests/"
+    "frontend/tests/",
+    "backend/"
   ],
   "allowed_files": [
     "frontend/package.json",
