@@ -11,7 +11,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import main  # noqa: E402
-from scan_service import MAX_FILES, MAX_FILE_BYTES  # noqa: E402
+from scan_service import MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES  # noqa: E402
 from static_scan import FINDING_FIELDS  # noqa: E402
 
 
@@ -67,6 +67,13 @@ def scan(files: list[dict]) -> tuple[int, dict]:
 
 def scan_file(path: str, content: str) -> dict:
     return {"file_path": path, "content": content}
+
+
+def padded_json_body(payload: dict, target_bytes: int) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    if len(body) > target_bytes:
+        raise ValueError("payload exceeds target body size")
+    return b" " * (target_bytes - len(body)) + body
 
 
 def request_from_chunks(
@@ -191,6 +198,76 @@ class RequestBodyLimitTests(unittest.TestCase):
 
     def test_understated_content_length_counts_actual_bytes(self):
         self.assert_rejected_before_scan([(b"content-length", b"1024")])
+
+    def test_exactly_max_raw_json_body_is_accepted(self):
+        content = "print('ok')\n"
+        body = padded_json_body(
+            {"files": [scan_file("src/limit.py", content)]},
+            main.MAX_SCAN_REQUEST_BODY_BYTES,
+        )
+        self.assertEqual(len(body), main.MAX_SCAN_REQUEST_BODY_BYTES)
+        self.assertLess(len(content.encode("utf-8")), MAX_TOTAL_BYTES)
+
+        status, payload, received_chunks = request_from_chunks(
+            [body],
+            [(b"content-length", str(len(body)).encode("ascii"))],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(payload["summary"]["scanned_count"], 1)
+        self.assertEqual(received_chunks, 1)
+
+    def test_one_byte_over_max_raw_json_body_is_rejected(self):
+        body = padded_json_body(
+            {"files": [scan_file("src/limit.py", "print('ok')\n")]},
+            main.MAX_SCAN_REQUEST_BODY_BYTES + 1,
+        )
+        self.assertEqual(len(body), main.MAX_SCAN_REQUEST_BODY_BYTES + 1)
+
+        with patch.object(main, "run_scan") as run_scan:
+            status, payload, received_chunks = request_from_chunks([body], [])
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            payload,
+            {
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": main.REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        self.assertEqual(received_chunks, 1)
+        run_scan.assert_not_called()
+
+    def test_multibyte_utf8_counts_raw_bytes_not_characters(self):
+        content = "😀" * (main.MAX_SCAN_REQUEST_BODY_BYTES // 4 + 1)
+        body_text = json.dumps(
+            {"files": [scan_file("src/emoji.py", content)]},
+            ensure_ascii=False,
+        )
+        body = body_text.encode("utf-8")
+        self.assertLess(len(body_text), main.MAX_SCAN_REQUEST_BODY_BYTES)
+        self.assertGreater(len(body), main.MAX_SCAN_REQUEST_BODY_BYTES)
+
+        with patch.object(main, "run_scan") as run_scan:
+            status, payload, received_chunks = request_from_chunks([body], [])
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            payload,
+            {
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": main.REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        self.assertEqual(received_chunks, 1)
+        run_scan.assert_not_called()
 
 
 class ScanEndpointTests(unittest.TestCase):
