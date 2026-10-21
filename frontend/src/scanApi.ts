@@ -100,6 +100,7 @@ const SCAN_ERROR_MESSAGES: Record<string, string> = {
 }
 
 const ANALYSIS_ERROR_MESSAGES: Record<string, string> = {
+  empty_finding_list: '没有可分析的 Finding，请先完成扫描。',
   invalid_model: '本地 AI 模型配置无效，请联系管理员检查模型配置。',
   model_endpoint_invalid: '本地 AI 服务地址配置无效，请联系管理员检查配置。',
   model_unavailable: '无法连接本地 AI 服务，请确认 Ollama 已启动后重试。',
@@ -444,6 +445,10 @@ export async function submitAnalysis(
   findings: readonly ScanFinding[],
   fetchImpl: typeof fetch = fetch,
 ): Promise<AnalysisResponse> {
+  if (findings.length === 0) {
+    throw new AnalysisRequestError(0, 'empty_finding_list')
+  }
+
   let response: Response
 
   try {

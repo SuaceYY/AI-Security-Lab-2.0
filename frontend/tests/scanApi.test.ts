@@ -480,6 +480,30 @@ test('提交分析请求使用固定路径并返回严格校验的成功结果',
   })
 })
 
+test('空 Finding 不发起分析请求', async () => {
+  let called = false
+  const fetchImpl = (async () => {
+    called = true
+    return {
+      ok: true,
+      status: 200,
+      json: async () => VALID_ANALYSIS_RESPONSE,
+    }
+  }) as unknown as typeof fetch
+
+  await assert.rejects(
+    submitAnalysis([], fetchImpl),
+    (error: unknown) => {
+      assert.ok(error instanceof AnalysisRequestError)
+      assert.equal(error.status, 0)
+      assert.equal(error.code, 'empty_finding_list')
+      assert.equal(formatAnalysisError(error), '没有可分析的 Finding，请先完成扫描。')
+      return true
+    },
+  )
+  assert.equal(called, false)
+})
+
 test('提交分析后按 finding_index 安全关联原 Finding', async () => {
   const findings: ScanFinding[] = [
     VALID_FINDING,
@@ -557,6 +581,43 @@ test('忽略越界、负数、非整数与重复的优先级索引', () => {
       { rule_id: 'PY-EVAL-EXEC', finding_index: 0, priority: 'critical' },
     ],
   )
+})
+
+test('接受超过 50 条 Finding 中按原始非连续索引返回的 50 条结果', async () => {
+  const findings = Array.from({ length: 100 }, (_, index) => ({
+    ...VALID_FINDING,
+    rule_id: `RULE-${index}`,
+    line: index + 1,
+  }))
+  const priorities = Array.from({ length: MAX_ANALYSIS_FINDINGS }, (_, offset) => {
+    const findingIndex = offset * 2
+    return {
+      finding_index: findingIndex,
+      priority: 'high' as const,
+      reason: `理由 ${findingIndex}`,
+    }
+  })
+  const response: AnalysisResponse = {
+    ...VALID_ANALYSIS_RESPONSE,
+    total_count: findings.length,
+    analyzed_count: MAX_ANALYSIS_FINDINGS,
+    priorities,
+  }
+
+  const result = await submitAnalysis(findings, successfulFetch(response))
+
+  assert.equal(result.total_count, 100)
+  assert.equal(result.analyzed_count, MAX_ANALYSIS_FINDINGS)
+  assert.deepEqual(
+    result.priorities.map(item => item.finding_index),
+    priorities.map(item => item.finding_index),
+  )
+
+  const matches = matchFindingPriorities(findings, result.priorities)
+  assert.equal(matches.length, MAX_ANALYSIS_FINDINGS)
+  assert.equal(matches[0].finding.rule_id, 'RULE-0')
+  assert.equal(matches.at(-1)?.finding.rule_id, 'RULE-98')
+  assert.equal(matches.at(-1)?.priority.finding_index, 98)
 })
 
 test('拒绝畸形分析 HTTP 200 响应', async () => {
@@ -642,6 +703,15 @@ test('拒绝畸形分析 HTTP 200 响应', async () => {
       },
     ],
     [
+      '优先级理由为空字符串',
+      {
+        ...VALID_ANALYSIS_RESPONSE,
+        priorities: [
+          { ...VALID_ANALYSIS_RESPONSE.priorities[0], reason: '' },
+        ],
+      },
+    ],
+    [
       '缺少优先级索引',
       {
         ...VALID_ANALYSIS_RESPONSE,
@@ -673,6 +743,21 @@ test('拒绝畸形分析 HTTP 200 响应', async () => {
   await expectInvalidAnalysisResponse(
     '优先级索引重复',
     duplicateIndex,
+    [VALID_FINDING, VALID_FINDING],
+  )
+
+  const countContradiction = {
+    ...VALID_ANALYSIS_RESPONSE,
+    total_count: 2,
+    analyzed_count: 1,
+    priorities: [
+      VALID_ANALYSIS_RESPONSE.priorities[0],
+      { ...VALID_ANALYSIS_RESPONSE.priorities[0], finding_index: 1 },
+    ],
+  }
+  await expectInvalidAnalysisResponse(
+    '分析数与优先级数量矛盾',
+    countContradiction,
     [VALID_FINDING, VALID_FINDING],
   )
 
