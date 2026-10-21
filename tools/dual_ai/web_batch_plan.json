@@ -1,19 +1,21 @@
 {
   "schema_version": 1,
-  "revision": 6,
-  "title": "网页阶段二起步：本地 AI Finding 优先级分析",
-  "roadmap": "阶段一的本地文件筛选、静态扫描、资源上限与真实 Edge 主流程已经完成。本批只进入阶段二的第一个小切片：让后端把既有 Finding 交给本机 Ollama 做结构化优先级分析。暂不做前端按钮、工具调用、独立证据核验或报告生成；旧 auto_lab.py、evidence_check.py、report_generator.py 不迁移、不修改，后续按大纲分批接入。",
-  "goal": "新增一个可测试、可限流、默认只访问 127.0.0.1:11434 的本地 AI 分析契约。使用 Ollama 官方 /api/chat、stream=false 和 JSON Schema structured output；只发送既有 Finding 的受限字段，不发送源码，不读取用户文件，不执行任何模型建议。模型名从 AI_SECURITY_LAB_OLLAMA_MODEL 读取并提供清晰默认值；HTTP 使用 Python 标准库且支持注入假传输，CI 不启动 Ollama、不访问网络。三轮继续复用两个真实 OpenCode TUI，经 GitHub 完成交接，第三轮整改后停止，人工主审后才合并。",
+  "revision": 7,
+  "title": "网页阶段二：前端接入本地 AI Finding 优先级分析",
+  "roadmap": "阶段一的本地文件筛选、静态扫描、资源上限与真实 Edge 主流程已经完成；阶段二首个后端切片（本机 Ollama Finding 优先级分析与 POST /analyses）已在 PR #44 合并。本批只做阶段二的下一个小切片：把现有扫描结果从网页提交给 /analyses，并在网页展示结构化优先级。不得修改后端、依赖、工作流或旧 auto_lab.py、evidence_check.py、report_generator.py；工具调用、独立证据核验和报告生成继续留待后续小批次。",
+  "goal": "在不增加依赖、不真实启动 Ollama 的前提下，为现有网页增加可测试的本地 AI 分析入口。前端只能把 ScanResponse.findings 的既有七个 Finding 字段发送到 /api/analyses，绝不再次发送所选文件的 content；严格校验成功响应和稳定错误，明确显示模型、摘要、分析数量及按 finding_index 对应的优先级理由。分析按钮只在静态扫描成功且存在 Finding 时可用；重新选目录或重新扫描必须清空旧分析状态。三轮继续复用两个真实 OpenCode TUI，经 GitHub 完成交接，第三轮整改后停止，人工主审后才合并。",
   "allowed_roots": [
-    "backend/"
+    "frontend/src/",
+    "frontend/tests/"
   ],
   "allowed_files": [],
   "allowed_suffixes": [
-    ".py"
+    ".ts",
+    ".tsx"
   ],
   "round_focus": [
-    "第一轮：只新建 backend/local_ai.py 与 backend/tests/test_local_ai.py。实现独立服务层：最多分析 50 个 Finding，按严重度稳定排序；请求 JSON 与提示词设置明确 UTF-8 字节上限，响应读取最多 256 KiB；固定请求 http://127.0.0.1:11434/api/chat，stream=false，format 使用 JSON Schema，think=false。传输必须可注入，单元测试只用假传输并断言不会访问真实网络；严格解析 summary 与 priorities，拒绝非 JSON、缺字段、超长文本、未知 Finding 引用和重复引用。不得修改 main.py。",
-    "第二轮：限 backend/main.py、backend/local_ai.py、backend/tests/test_local_ai.py。新增 POST /analyses，输入复用现有 Finding 字段，输出包含 status、model、total_count、analyzed_count、summary、priorities；请求体也必须受现有 8 MiB 中间件保护。把本机服务未启动/超时、上游非 2xx、响应过大、结构错误分别映射为稳定错误码与合适 HTTP 状态，错误中不得回显提示词、模型原文或源码。补 ASGI 级成功和失败测试；测试不得依赖本机 Ollama。",
-    "第三轮：仍只限上述三个文件，补边界回归：0 个 Finding 不调用模型并返回确定结果；超过 50 个只按已声明规则选择且准确报告 total_count/analyzed_count；UTF-8 路径与中文摘要按字节限额；恶意模型输出不能注入额外 Finding 或超长内容；环境变量模型名非法时安全失败。固定运行 backend 全部 unittest，并确认现有扫描接口与 8 MiB 分片中间件测试仍通过。报告只贴命令、总数、失败数与必要错误摘要，避免 GitHub 单条超预算。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若必须新增依赖、修改前端/工作流/旧证据报告脚本、访问非回环地址或需要人工启动模型，立即 needs_human 停止询问。"
+    "第一轮：只允许修改 frontend/src/scanApi.ts 与 frontend/tests/scanApi.test.ts。新增 AnalysisRequest、AnalysisResponse、FindingPriority 等前端契约，以及 buildAnalysisRequest、submitAnalysis、parse/formatAnalysisError；固定请求 /api/analyses，只序列化传入的 ScanFinding 数组，不读取 File、不携带 ScanFileInput.content。成功响应必须校验 status=done、非空 model/summary、非负安全整数 total_count/analyzed_count、analyzed_count<=50 且不大于 total_count、priorities 数量与 analyzed_count 一致、finding_index 为不重复且落在 total_count 范围内的安全整数、priority 仅 critical/high/medium/low、reason 非空。结合本次实际请求再校验 total_count 等于提交 Finding 数量。覆盖成功、畸形 HTTP 200、后端错误码与网络异常；不得修改 App.tsx、依赖或后端。",
+    "第二轮：仍只允许修改 frontend/src/App.tsx、frontend/src/scanApi.ts、frontend/tests/scanApi.test.ts。把第一轮 API 接入现有扫描成功界面：只有 findings 非空时显示“使用本地 AI 分析优先级”按钮；点击后提交当前 scanState.result.findings，提供 idle/loading/success/error 独立状态，分析期间防重复提交。重新选择目录或重新开始扫描时清空旧分析状态。成功区显示本地模型名、摘要、total_count/analyzed_count，并按 finding_index 安全关联原 Finding，展示 priority 与 reason；未知索引不得渲染。页面明确说明只发送 Finding 字段、不发送完整源码，AI 结果需人工复核。不得新增 CSS 文件或依赖，不真实连接 Ollama。",
+    "第三轮：仍只限上述三个文件，做边界回归和最小可用性收口。补测试验证空 Finding 不触发分析请求、超过 50 条时能接受后端按原始非连续索引返回的 50 条结果、重复/越界索引及计数矛盾的 200 响应被拒绝、model/summary/reason 空值和非法 priority 被拒绝、所有 model_*、analysis_request_too_large、request_too_large、invalid_request 错误均映射为可读中文且不回显服务端原文。核对按钮禁用、旧结果清理和 React 文本转义，不使用 dangerouslySetInnerHTML。固定运行前端全部 node:test、npm run build、npm run lint，以及后端全部 unittest 确认无回归；报告只给命令、总数、失败数和必要摘要，避免 GitHub 单条超预算。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若必须新增依赖、修改后端/工作流/旧脚本、真实启动或安装 Ollama、访问非回环地址，立即 needs_human 停止询问。"
   ]
 }
