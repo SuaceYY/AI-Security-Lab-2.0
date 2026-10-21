@@ -44,6 +44,49 @@ FORMAT = (
 )
 
 
+GENERATED_REVIEW_FILES = frozenset({"frontend/package-lock.json"})
+
+
+def generated_review_summary(path: str, content: str) -> dict | None:
+    """Return a bounded, reproducible review record for generated lock files."""
+    if path not in GENERATED_REVIEW_FILES:
+        return None
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HumanRequired("生成锁文件不是有效 JSON：" + path) from exc
+    packages = payload.get("packages")
+    root = packages.get("") if isinstance(packages, dict) else None
+    if not isinstance(root, dict):
+        raise HumanRequired("生成锁文件缺少根依赖信息：" + path)
+    dependencies = root.get("dependencies", {})
+    dev_dependencies = root.get("devDependencies", {})
+    if not isinstance(dependencies, dict) or not isinstance(dev_dependencies, dict):
+        raise HumanRequired("生成锁文件根依赖格式不合法：" + path)
+    direct = {}
+    for name in sorted(set(dependencies) | set(dev_dependencies)):
+        item = packages.get("node_modules/" + name)
+        if not isinstance(item, dict):
+            raise HumanRequired("生成锁文件缺少直接依赖解析：" + name)
+        direct[name] = {
+            key: item[key]
+            for key in ("version", "resolved", "integrity", "dev", "optional")
+            if key in item
+        }
+    raw = content.encode("utf-8")
+    return {
+        "format": "npm-package-lock-summary-v1",
+        "generated": True,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "lockfile_version": payload.get("lockfileVersion"),
+        "package_entries": len(packages),
+        "root_dependencies": dependencies,
+        "root_dev_dependencies": dev_dependencies,
+        "direct_packages": direct,
+    }
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -208,6 +251,19 @@ class WebBatch:
             self.batch_lock.release()
             raise
 
+    def _verified_development_pause_allowed(self, question):
+        if question == "文件超出本批网页开发范围：backend/main.py":
+            return True
+        prefix = "源码文件超出本批逐文件审查预算："
+        if not isinstance(question, str) or not question.startswith(prefix):
+            return False
+        path = question[len(prefix):]
+        try:
+            check_scope([path], self.plan)
+        except HumanRequired:
+            return False
+        return path in GENERATED_REVIEW_FILES
+
     def enter_resume_verified_development(self):
         """Resume only after a verified, pushed development commit and snapshot-scope pause.
 
@@ -224,7 +280,7 @@ class WebBatch:
                 or previous.get("plan_sha256") != plan_digest(self.plan)
                 or previous.get("phase") != "needs_human"
                 or previous.get("action") != "development"
-                or previous.get("question") != "文件超出本批网页开发范围：backend/main.py"
+                or not self._verified_development_pause_allowed(previous.get("question"))
                 or number != 1 or previous.get("rounds_completed") != 0
                 or previous.get("verified_development_recovery_attempts", 0) != 0
                 or previous.get("last_phase") is not None
@@ -755,17 +811,26 @@ class WebBatch:
             content = local.read_text(encoding="utf-8-sig")
             if redact(content) != content:
                 raise HumanRequired("源码含疑似敏感内容，停止发布：" + path)
-            if len(content.encode("utf-8")) > 18000:
-                raise HumanRequired("源码文件超出本批逐文件审查预算：" + path)
+            data = None
+            published = content
             if verified:
                 from urllib.parse import quote
                 data = self.api("contents/" + quote(path, safe="/") + "?ref=" + self.head)
                 published = base64.b64decode(data["content"]).decode("utf-8-sig")
                 if published.replace("\r\n", "\n") != content:
                     raise HumanRequired("GitHub 源码与本地已验证内容不一致：" + path)
+            generated = generated_review_summary(path, published)
+            if generated is not None:
+                sources[path] = {
+                    **({"sha": data.get("sha")} if data else {"uncommitted": True}),
+                    "generated_summary": generated,
+                }
+            elif len(published.encode("utf-8")) > 18000:
+                raise HumanRequired("源码文件超出本批逐文件审查预算：" + path)
+            elif verified:
                 sources[path] = {"sha": data.get("sha"), "content": published}
             else:
-                sources[path] = {"uncommitted": True, "content": content}
+                sources[path] = {"uncommitted": True, "content": published}
         return {"origin": "github_commit" if verified else "working_tree_snapshot_published_in_issue",
                 "head_sha": self.head, "files": sources}
 

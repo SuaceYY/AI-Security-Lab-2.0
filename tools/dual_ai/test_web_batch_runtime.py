@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch, Mock
 
 from tools.dual_ai.web_batch import HumanRequired
-from tools.dual_ai.web_batch_runtime import WebBatch, FENCE, format_compatibility_checkpoint
+from tools.dual_ai.web_batch_runtime import (\n    WebBatch, FENCE, format_compatibility_checkpoint, generated_review_summary,\n)
 from tools.issue_claimer import claimer as worker
 
 PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(encoding="utf-8"))
@@ -17,6 +17,40 @@ PLAN = json.loads((Path(__file__).parent / "web_batch_plan.json").read_text(enco
 # plan can be narrower; never relax its production scope to satisfy a test.
 PLAN["allowed_suffixes"] = [".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".json"]
 RUNTIME = "tools.dual_ai.web_batch_runtime."
+
+
+class GeneratedReviewSummaryTests(unittest.TestCase):
+    def test_package_lock_is_bounded_but_keeps_direct_dependency_evidence(self):
+        content = json.dumps({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "dependencies": {"react": "^19.3.1"},
+                    "devDependencies": {"@playwright/test": "^1.64.1"},
+                },
+                "node_modules/react": {
+                    "version": "19.3.1",
+                    "resolved": "https://registry.npmjs.org/react/-/react-19.3.1.tgz",
+                    "integrity": "sha512-react",
+                },
+                "node_modules/@playwright/test": {
+                    "version": "1.64.1",
+                    "resolved": "https://registry.npmjs.org/@playwright/test/-/test-1.64.1.tgz",
+                    "integrity": "sha512-playwright",
+                    "dev": True,
+                },
+            },
+        }, sort_keys=True)
+        summary = generated_review_summary("frontend/package-lock.json", content)
+        self.assertEqual(summary["lockfile_version"], 3)
+        self.assertEqual(summary["package_entries"], 3)
+        self.assertEqual(summary["direct_packages"]["@playwright/test"]["version"], "1.64.1")
+        self.assertEqual(summary["bytes"], len(content.encode("utf-8")))
+        self.assertEqual(summary["sha256"], hashlib.sha256(content.encode("utf-8")).hexdigest())
+        self.assertNotIn("content", summary)
+
+    def test_non_generated_source_keeps_normal_snapshot_path(self):
+        self.assertIsNone(generated_review_summary("frontend/src/App.tsx", "source"))
 
 
 class RuntimeTests(unittest.TestCase):
