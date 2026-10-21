@@ -87,7 +87,7 @@ def parse_result(text: str) -> dict:
 
 def validate_plan(plan: dict) -> dict:
     required = {"schema_version", "revision", "title", "roadmap", "goal",
-                "allowed_roots", "allowed_suffixes", "round_focus"}
+                "allowed_roots", "allowed_files", "allowed_suffixes", "round_focus"}
     if not isinstance(plan, dict) or set(plan) != required or plan["schema_version"] != 1:
         raise ValueError("invalid web batch plan schema")
     if not isinstance(plan["revision"], int) or plan["revision"] < 1:
@@ -95,8 +95,23 @@ def validate_plan(plan: dict) -> dict:
     for key in ("title", "roadmap", "goal"):
         if not isinstance(plan[key], str) or not 1 <= len(plan[key]) <= 12000:
             raise ValueError("invalid plan text: " + key)
-    if plan["allowed_roots"] != ["frontend/src/", "frontend/tests/", "backend/"]:
-        raise ValueError("only the approved web source/test roots are allowed")
+    roots = plan["allowed_roots"]
+    approved_roots = {"frontend/src/", "frontend/tests/", "backend/"}
+    if (
+        not isinstance(roots, list)
+        or not roots
+        or len(roots) != len(set(roots))
+        or any(root not in approved_roots for root in roots)
+    ):
+        raise ValueError("only approved web source/test roots are allowed")
+    allowed_files = plan["allowed_files"]
+    approved_files = {"frontend/package.json", "frontend/package-lock.json"}
+    if (
+        not isinstance(allowed_files, list)
+        or len(allowed_files) != len(set(allowed_files))
+        or any(path not in approved_files for path in allowed_files)
+    ):
+        raise ValueError("only approved exact web files are allowed")
     suffixes = plan["allowed_suffixes"]
     if (not isinstance(suffixes, list) or not suffixes
             or any(not isinstance(x, str) or x not in {".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".json"} for x in suffixes)):
@@ -118,10 +133,13 @@ def check_scope(paths: list[str], plan: dict) -> None:
             raise HumanRequired("文件路径不是字符串。")
         parts = Path(path).parts
         if ("\\" in path or path.startswith("/")
-                or ".." in parts or not any(path.startswith(root) for root in plan["allowed_roots"])
+                or ".." in parts
+                or not (path in plan["allowed_files"]
+                        or any(path.startswith(root) for root in plan["allowed_roots"]))
                 or Path(path).suffix not in plan["allowed_suffixes"]
                 or any(x in {".git", ".env", "__pycache__", "node_modules", ".venv"} for x in parts)
-                or Path(path).name in {"package.json", "package-lock.json", "tsconfig.json"}):
+                or (Path(path).name in {"package.json", "package-lock.json", "tsconfig.json"}
+                    and path not in plan["allowed_files"])):
             raise HumanRequired("文件超出本批网页开发范围：" + str(path))
 
 

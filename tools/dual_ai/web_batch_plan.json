@@ -1,20 +1,25 @@
 {
   "schema_version": 1,
-  "revision": 4,
-  "title": "网页阶段一加固：限制 Finding 数量与扫描响应体积",
-  "roadmap": "沿用已合并的网页静态扫描、前端深层校验及请求体限额。此批只补扫描结果输出资源边界，后续分别安排真实浏览器验收与原大纲中的本地 AI、独立证据核验、报告交付、稳定性和成本控制。",
-  "goal": "对用户主动提交的本地代码，服务端在生成结果时限制每次扫描最多 1000 条 Finding，并限制整个成功响应的序列化 JSON 不超过 2 MiB；超出时明确返回 HTTP 413、status=failed 及稳定错误码，不截断伪造完整扫描。预算计算须覆盖重复路径、文件状态、统计数据与 Findings，不因碎行或长文件名产生巨量响应。三轮复用当前两个真实 OpenCode TUI，在 GitHub 交接和核验后停止，人工主审及批准后才合并。仅涉及扫描器、服务及其最小测试，不新增依赖，不执行被扫描代码。",
+  "revision": 5,
+  "title": "网页阶段一验收：真实浏览器扫描主流程",
+  "roadmap": "沿用已合并的网页文件筛选、静态扫描 API、深层响应校验以及请求/响应资源上限。本批只补真实浏览器中的主流程验收；完成后按原大纲进入本地 AI 集成、独立证据核验、自动报告与稳定性成本控制。",
+  "goal": "在 Windows 已安装的 Microsoft Edge 中使用 Playwright 驱动真实网页，验证选择本地代码文件、前端排除敏感或不支持文件、只提交允许文件、展示统一 Finding 和可读错误的完整用户流程。测试使用浏览器级 API 路由替身以保持确定性，不访问外网、不执行所选代码；仅增加轻量测试依赖，不下载额外浏览器。三轮继续复用现有两个真实 OpenCode TUI，通过 GitHub 交接，第三轮整改后自动停止，人工主审后才合并。",
   "allowed_roots": [
     "frontend/src/",
-    "frontend/tests/",
-    "backend/"
+    "frontend/tests/"
+  ],
+  "allowed_files": [
+    "frontend/package.json",
+    "frontend/package-lock.json"
   ],
   "allowed_suffixes": [
-    ".py"
+    ".ts",
+    ".tsx",
+    ".json"
   ],
   "round_focus": [
-    "第一轮：只在 backend/static_scan.py、backend/scan_service.py、新建 backend/tests/test_finding_limits.py 内实现每次扫描最多 1000 条 Finding。支持跨文件累计，在生成第 1001 条时及时拒绝，返回 HTTP 413 且 detail.status=failed、code=too_many_findings；恰好 1000 条正常完成并保持统计一致。不可先生成海量 Findings 再截断，保留已有正常输入和文件过滤行为。",
-    "第二轮：仍限上述三文件，加入成功响应最大 2 MiB JSON 字节预算，累计计算文件状态、摘要、Finding及重复路径；临界前校验，不构造无界重复路径或海量输出。超限返回 HTTP 413、code=scan_output_too_large；验证长路径即使 Finding 较少也被拒绝，且超限不返回 status=done。不要修改前端或请求体 8 MiB 限制。",
-    "第三轮：仅在三文件范围内补计数/字节恰好边界、多文件、零 Finding、跳过文件及 UTF-8 输入回归；有真实缺陷才改实现。运行后端全部测试、前端原有测试、build、lint，逐项发布命令与真实输出。GLM 审查及 DeepSeek 整改完成后自动停止，不合并、不启动第四轮；若发现必须超范围修改，暂停询问用户。"
+    "第一轮：只修改 frontend/package.json、frontend/package-lock.json，并新建 frontend/tests/scanFlow.e2e.ts；加入 @playwright/test 和 test:e2e 命令，固定使用 Windows 已安装的 msedge，不执行浏览器下载。以真实浏览器打开 Vite 页面，拦截 /api/health 与 /api/scans，选择一个允许的代码文件，点击开始扫描，断言仅允许文件的路径与文本进入请求，并在页面看到 done、问题数、rule_id、证据和建议。总改动控制在上述三个文件。",
+    "第二轮：仍限上述三个文件，补一个混合选择场景和一个失败场景：敏感文件或不支持文件必须在页面显示排除原因且绝不进入 /api/scans 请求；服务端 413 的 too_many_findings 或 scan_output_too_large 必须显示已有可读错误且不能出现成功结果。若真实浏览器揭示生产缺陷，才允许最小修改 frontend/src/App.tsx 或 frontend/src/scanApi.ts，并必须在报告中说明原因和证据。",
+    "第三轮：只补稳定性回归：健康检查显示、扫描按钮 loading/恢复、零 Finding 成功结果，以及 UTF-8 路径/证据渲染；不得重复覆盖同一行为。固定运行前端现有 18 项 Node 测试、Playwright Edge 测试、build、lint，以及后端全部测试；逐项发布命令和真实输出。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若机器没有 Edge、依赖安装失败或需要扩大文件范围，立即 needs_human 停止询问。"
   ]
 }

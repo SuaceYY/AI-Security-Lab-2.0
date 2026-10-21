@@ -128,17 +128,29 @@ class BatchContractTests(unittest.TestCase):
             run_batch(bridge, PLAN)
         self.assertNotIn(("repair", 1), bridge.events)
 
-    def test_plan_requires_exactly_three_and_approved_roots(self):
-        for key, value in (("round_focus", ["one"]), ("allowed_roots", ["tools/"]),
-                           ("allowed_suffixes", [["bad"]])):
+    def test_plan_requires_exactly_three_and_approved_scope(self):
+        for key, value in (
+            ("round_focus", ["one"]),
+            ("allowed_roots", ["tools/"]),
+            ("allowed_files", ["frontend/tsconfig.json"]),
+            ("allowed_suffixes", [["bad"]]),
+        ):
             plan = copy.deepcopy(PLAN)
             plan[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_plan(plan)
 
     def test_scope_blocks_traversal_protected_paths_and_dependencies(self):
-        check_scope(["backend/tests/test_scan.py", "frontend/src/App.tsx"], PLAN)
-        for path in ("backend/../tools/x.py", "tools/x.py", "frontend/package.json",
+        check_scope(
+            [
+                "backend/tests/test_scan.py",
+                "frontend/src/App.tsx",
+                "frontend/package.json",
+                "frontend/package-lock.json",
+            ],
+            PLAN,
+        )
+        for path in ("backend/../tools/x.py", "tools/x.py", "frontend/tsconfig.json",
                      "backend/.env", "backend/node_modules/x.js", "/backend/x.py",
                      "backend\\x.py"):
             with self.subTest(path=path), self.assertRaises(HumanRequired):
