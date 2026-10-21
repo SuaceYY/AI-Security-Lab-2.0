@@ -19,7 +19,7 @@
     ".json"
   ],
   "round_focus": [
-    "第一轮：只修改 frontend/package.json、frontend/package-lock.json，并新建 frontend/tests/scanFlow.e2e.ts；加入 @playwright/test 和 test:e2e 命令，固定使用 Windows 已安装的 msedge，不执行浏览器下载。以真实浏览器打开 Vite 页面，拦截 /api/health 与 /api/scans，选择一个允许的代码文件，点击开始扫描，断言仅允许文件的路径与文本进入请求，并在页面看到 done、问题数、rule_id、证据和建议。总改动控制在上述三个文件。",
+    "第一轮：只修改 frontend/package.json、frontend/package-lock.json，并新建 frontend/tests/scanFlow.spec.ts；加入 @playwright/test 和 test:e2e 命令，固定使用 Windows 已安装的 msedge，不执行浏览器下载。以真实浏览器打开 Vite 页面，拦截 /api/health 与 /api/scans，选择一个允许的代码文件，点击开始扫描，断言仅允许文件的路径与文本进入请求，并在页面看到 done、问题数、rule_id、证据和建议。总改动控制在上述三个文件。",
     "第二轮：仍限上述三个文件，补一个混合选择场景和一个失败场景：敏感文件或不支持文件必须在页面显示排除原因且绝不进入 /api/scans 请求；服务端 413 的 too_many_findings 或 scan_output_too_large 必须显示已有可读错误且不能出现成功结果。若真实浏览器揭示生产缺陷，才允许最小修改 frontend/src/App.tsx 或 frontend/src/scanApi.ts，并必须在报告中说明原因和证据。",
     "第三轮：只补稳定性回归：健康检查显示、扫描按钮 loading/恢复、零 Finding 成功结果，以及 UTF-8 路径/证据渲染；不得重复覆盖同一行为。固定运行前端现有 18 项 Node 测试、Playwright Edge 测试、build、lint，以及后端全部测试；逐项发布命令和真实输出。GLM 审查、DeepSeek 整改后自动停止，不合并、不启动第四轮；若机器没有 Edge、依赖安装失败或需要扩大文件范围，立即 needs_human 停止询问。"
   ]
