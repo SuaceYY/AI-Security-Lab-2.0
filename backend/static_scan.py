@@ -58,6 +58,14 @@ class Finding:
         }
 
 
+class FindingLimitExceeded(ValueError):
+    """表示本次扫描发现的 Finding 数量超过调用方给定上限。"""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"Finding 数量超过上限 {limit}。")
+        self.limit = limit
+
+
 RULES: tuple[Rule, ...] = (
     Rule(
         rule_id="PY-EVAL-EXEC",
@@ -152,14 +160,22 @@ def _make_evidence(line: str) -> str:
     return evidence
 
 
-def scan_text(file_path: str, text: str) -> list[Finding]:
+def scan_text(
+    file_path: str,
+    text: str,
+    *,
+    max_findings: int | None = None,
+) -> list[Finding]:
     """扫描单个文本，返回按行号升序排列的 Finding 列表。
 
     只支持受支持的代码扩展名；其他扩展名返回空列表。扫描过程不读取
-    外部文件，也不执行 text 中的任何内容。
+    外部文件，也不执行 text 中的任何内容。给定 max_findings 时，在发现
+    下一条超限 Finding 前抛出 FindingLimitExceeded，不收集超限结果。
     """
     if not isinstance(text, str):
         raise TypeError("text 必须是字符串")
+    if max_findings is not None and max_findings < 0:
+        raise ValueError("max_findings 不能为负数")
 
     normalized_path = normalize_relative_path(file_path)
     extension = _extension_of(normalized_path)
@@ -183,6 +199,8 @@ def scan_text(file_path: str, text: str) -> list[Finding]:
             key = (rule.rule_id, line_number)
             if key in seen:
                 continue
+            if max_findings is not None and len(findings) >= max_findings:
+                raise FindingLimitExceeded(max_findings)
             seen.add(key)
             findings.append(
                 Finding(

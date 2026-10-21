@@ -16,6 +16,7 @@ try:
     from .static_scan import (
         SUPPORTED_EXTENSIONS,
         Finding,
+        FindingLimitExceeded,
         normalize_relative_path,
         scan_text,
     )
@@ -23,6 +24,7 @@ except ImportError:
     from static_scan import (  # type: ignore[no-redef]
         SUPPORTED_EXTENSIONS,
         Finding,
+        FindingLimitExceeded,
         normalize_relative_path,
         scan_text,
     )
@@ -30,6 +32,7 @@ except ImportError:
 MAX_FILES = 100
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 5 * 1024 * 1024
+MAX_FINDINGS = 1000
 
 EXCLUDED_DIRECTORIES = frozenset(
     {
@@ -346,7 +349,18 @@ def run_scan(
             )
             continue
 
-        file_findings = scan_text(file_path, content)
+        try:
+            file_findings = scan_text(
+                file_path,
+                content,
+                max_findings=MAX_FINDINGS - len(findings),
+            )
+        except FindingLimitExceeded as exc:
+            raise ScanValidationError(
+                "too_many_findings",
+                f"扫描结果 Finding 数量超过上限 {MAX_FINDINGS}。",
+                status_code=413,
+            ) from exc
         findings.extend(file_findings)
         file_results.append(
             ScannedFile(
