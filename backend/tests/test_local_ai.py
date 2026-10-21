@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import sys
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +11,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import main  # noqa: E402
 from local_ai import (  # noqa: E402
     DEFAULT_MODEL,
     MAX_ANALYSIS_FINDINGS,
@@ -109,6 +112,63 @@ def valid_responder(
         return 200, chat_response({"summary": summary, "priorities": priorities})
 
     return respond
+
+
+def asgi_post(
+    path: str,
+    payload: dict | None = None,
+    *,
+    body: bytes | None = None,
+    content_length: int | None = None,
+) -> tuple[int, dict]:
+    if body is None:
+        body = b"" if payload is None else json.dumps(
+            payload, ensure_ascii=False
+        ).encode("utf-8")
+    length = len(body) if content_length is None else content_length
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(length).encode("ascii")),
+        ],
+        "server": ("testserver", 80),
+        "client": ("testclient", 12345),
+        "state": {},
+    }
+    messages: list[dict] = []
+    request_sent = False
+
+    async def receive() -> dict:
+        nonlocal request_sent
+        if request_sent:
+            return {"type": "http.disconnect"}
+        request_sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: dict) -> None:
+        messages.append(message)
+
+    asyncio.run(main.app(scope, receive, send))
+
+    start = next(
+        message for message in messages if message["type"] == "http.response.start"
+    )
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], json.loads(response_body.decode("utf-8"))
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -465,6 +525,153 @@ class TransportErrorTests(unittest.TestCase):
             analyze_findings([finding()], transport=transport)
 
         self.assertEqual(caught.exception.code, "model_invalid_response")
+
+
+class AnalysisEndpointTests(unittest.TestCase):
+    def post_with_transport(self, transport, findings=None):
+        findings = findings or [finding().to_dict()]
+        with (
+            patch.dict(os.environ, {MODEL_ENV_VAR: ""}, clear=False),
+            patch.object(
+                main,
+                "analyze_findings",
+                partial(analyze_findings, transport=transport),
+            ),
+        ):
+            return asgi_post("/analyses", {"findings": findings})
+
+    def test_asgi_success_uses_injected_transport_and_returns_contract(self):
+        transport = FakeTransport(responder=valid_responder())
+        status, payload = self.post_with_transport(transport)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(payload),
+            {
+                "status",
+                "model",
+                "total_count",
+                "analyzed_count",
+                "summary",
+                "priorities",
+            },
+        )
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(payload["model"], DEFAULT_MODEL)
+        self.assertEqual(payload["total_count"], 1)
+        self.assertEqual(payload["analyzed_count"], 1)
+        self.assertEqual(payload["summary"], "按现有证据优先处理高风险 Finding。")
+        self.assertEqual(
+            payload["priorities"],
+            [
+                {
+                    "finding_index": 0,
+                    "priority": "high",
+                    "reason": "规则严重度高，且证据显示直接执行动态内容。",
+                }
+            ],
+        )
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0]["url"], OLLAMA_CHAT_URL)
+        prompted = prompt_findings(transport.calls[0]["body"])
+        self.assertEqual(prompted[0]["file_path"], "src/file1.py")
+
+    def test_asgi_maps_local_ai_failures_to_stable_errors(self):
+        cases = [
+            ("timeout", FakeTransport(error=TimeoutError("slow")), 504, "model_timeout"),
+            (
+                "unavailable",
+                FakeTransport(error=ConnectionRefusedError("offline")),
+                503,
+                "model_unavailable",
+            ),
+            (
+                "upstream",
+                FakeTransport(status=500, response_body=b"SECRET_UPSTREAM_BODY"),
+                502,
+                "model_http_error",
+            ),
+            (
+                "response_too_large",
+                FakeTransport(response_body=b"x" * (MAX_RESPONSE_BYTES + 1)),
+                502,
+                "model_response_too_large",
+            ),
+            (
+                "invalid_response",
+                FakeTransport(response_body=b"{}"),
+                502,
+                "model_invalid_response",
+            ),
+        ]
+
+        for name, transport, expected_status, expected_code in cases:
+            with self.subTest(name=name):
+                status, payload = self.post_with_transport(transport)
+
+                self.assertEqual(status, expected_status)
+                self.assertEqual(payload["detail"]["status"], "failed")
+                self.assertEqual(payload["detail"]["code"], expected_code)
+                self.assertTrue(payload["detail"]["message"])
+                self.assertNotIn(
+                    "SECRET_UPSTREAM_BODY",
+                    json.dumps(payload, ensure_ascii=False),
+                )
+
+    def test_asgi_maps_oversized_prompt_without_calling_transport(self):
+        transport = FakeTransport(responder=valid_responder())
+        oversized = finding(evidence="a" * MAX_PROMPT_BYTES).to_dict()
+
+        status, payload = self.post_with_transport(transport, [oversized])
+
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["detail"]["status"], "failed")
+        self.assertEqual(payload["detail"]["code"], "analysis_request_too_large")
+        self.assertEqual(transport.calls, [])
+
+    def test_asgi_invalid_model_fails_before_transport(self):
+        transport = FakeTransport(responder=valid_responder())
+
+        with (
+            patch.dict(
+                os.environ,
+                {MODEL_ENV_VAR: "bad model\n"},
+                clear=False,
+            ),
+            patch.object(
+                main,
+                "analyze_findings",
+                partial(analyze_findings, transport=transport),
+            ),
+        ):
+            status, payload = asgi_post(
+                "/analyses",
+                {"findings": [finding().to_dict()]},
+            )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["detail"]["status"], "failed")
+        self.assertEqual(payload["detail"]["code"], "invalid_model")
+        self.assertEqual(transport.calls, [])
+
+    def test_analyses_is_protected_by_request_body_limit(self):
+        body = b" " * (main.MAX_SCAN_REQUEST_BODY_BYTES + 1)
+
+        with patch.object(main, "analyze_findings") as analyze:
+            status, payload = asgi_post("/analyses", body=body)
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            payload,
+            {
+                "detail": {
+                    "status": "failed",
+                    "code": "request_too_large",
+                    "message": main.REQUEST_TOO_LARGE_MESSAGE,
+                }
+            },
+        )
+        analyze.assert_not_called()
 
 
 if __name__ == "__main__":
