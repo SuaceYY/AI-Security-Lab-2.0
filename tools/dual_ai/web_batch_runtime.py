@@ -88,6 +88,58 @@ def generated_review_summary(path: str, content: str) -> dict | None:
     }
 
 
+def review_prompt_manifest(report: dict) -> dict:
+    """Keep model input bounded while preserving GitHub-verifiable evidence."""
+    files = {}
+    for path, item in sorted(report.get("source", {}).get("files", {}).items()):
+        if not isinstance(item, dict):
+            continue
+        record = {key: item[key] for key in ("sha", "deleted", "uncommitted")
+                  if key in item}
+        content = item.get("content")
+        if isinstance(content, str):
+            raw = content.encode("utf-8")
+            record.update({
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            })
+        if "generated_summary" in item:
+            record["generated_summary"] = item["generated_summary"]
+        files[path] = record
+    steps = []
+    for step in report.get("verification", {}).get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        output = step.get("output", "")
+        raw = output.encode("utf-8") if isinstance(output, str) else b""
+        steps.append({
+            key: step.get(key)
+            for key in ("label", "command", "cwd", "exit_code", "timed_out")
+        } | {
+            "output_bytes": len(raw),
+            "output_sha256": hashlib.sha256(raw).hexdigest(),
+            "output_tail": output[-1200:] if isinstance(output, str) else "",
+        })
+    return {
+        "batch_id": report.get("batch_id"),
+        "round": report.get("round"),
+        "phase": report.get("phase"),
+        "head_sha": report.get("head_sha"),
+        "pr": report.get("pr"),
+        "source_hash": report.get("source_hash"),
+        "source_origin": report.get("source", {}).get("origin"),
+        "source_files": files,
+        "model_result": report.get("model_result"),
+        "verification": {
+            "ok": report.get("verification", {}).get("ok"),
+            "reason": report.get("verification", {}).get("reason"),
+            "steps": steps,
+        },
+        "github_commit_url": "https://github.com/" + REPO + "/commit/" + str(report.get("head_sha")),
+        "github_pr_files_url": "https://github.com/" + REPO + "/pull/" + str(report.get("pr")) + "/files",
+    }
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -150,6 +202,7 @@ class WebBatch:
         self.sessions = None
         self.backend_environment = None
         self.replay_refused = False
+        self.reuse_review_started_round = None
 
     @staticmethod
     def status(batch_id):
@@ -445,8 +498,28 @@ class WebBatch:
         if not isinstance(comments, list) or len(comments) >= 100:
             raise HumanRequired("无法完整核对恢复点之后的交接历史。")
         marker = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase=review_started -->"
-        if any(marker in c.get("body", "") for c in comments if isinstance(c, dict)):
+        review_started = sum(marker in c.get("body", "")
+                             for c in comments if isinstance(c, dict))
+        prefix = "<!-- web-batch=" + self.batch_id + " round=" + str(number) + " phase="
+        current_model_events = [
+            event for event in previous.get("context_events", [])
+            if event.get("round") == number and event.get("phase") == "model_usage"
+            and event.get("data", {}).get("role") == "planner"
+            and event.get("data", {}).get("purpose", "task") == "task"
+        ]
+        pending_review = (
+            review_started == 1
+            and previous.get("action") == "review"
+            and previous.get("question") == "单次任务超过上下文安全预算，请人工缩小任务。"
+            and not current_model_events
+            and not any(prefix + phase + " -->" in c.get("body", "")
+                        for c in comments if isinstance(c, dict)
+                        for phase in ("review", "repair_started", "repair", "round_complete"))
+        )
+        if review_started and not pending_review:
             raise HumanRequired("GLM 可能已接收本轮任务，禁止自动重复投递。")
+        if pending_review:
+            self.reuse_review_started_round = number
         report = self.fetch(self.resume_report_ref)
         if (report.get("batch_id") != self.batch_id or report.get("round") != number
                 or report.get("phase") != "development" or report.get("head_sha") != head
@@ -932,10 +1005,14 @@ class WebBatch:
                                                 ensure_ascii=False).encode()).hexdigest()
         if actual_hash != report.get("source_hash"):
             raise HumanRequired("GitHub 报告源码摘要不匹配，请人工检查。")
-        self.begin_call(number, "review")
+        if self.reuse_review_started_round != number:
+            self.begin_call(number, "review")
         before = self.fingerprint()
+        manifest = review_prompt_manifest(report)
         text = self.sessions.call("planner", self.prompt(number, "review", {
-            "从GitHub重新读取的完整开发报告及源码": report,
+            "GitHub开发报告的有界核验清单": manifest,
+            "强制源码核验": "必须使用当前只读工具打开清单中的 GitHub commit/PR diff，并按 source_files 逐个核对实际源码；"
+            "不得只依据开发摘要下结论。完整报告、源码与测试日志已在 Issue 分页保留，清单提供提交、文件哈希和日志哈希。",
             "评审要求": "逐项核对本轮子步骤、源码、测试输出和现存风险。仅评审，不改文件。"
             "普通缺陷用 changes_requested；缺证据用 needs_evidence；真实通过用 pass；必须人工决定用 needs_human。"
             "instructions 给出下一步开发意见及可解释的验证建议，禁止越界或自动合并命令。",
